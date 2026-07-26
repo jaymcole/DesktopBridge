@@ -16,6 +16,19 @@ function int(name, fallback) {
   return n;
 }
 
+/**
+ * Parse UI_ORIGIN into a value the `cors` middleware understands. Accepts a
+ * single origin, a comma-separated list (the app is reachable under several
+ * origins — e.g. http://localhost:5173 in dev and http://accontroller.local:8080
+ * when served on the LAN), or "*" to allow any.
+ */
+function parseOrigins(raw) {
+  if (!raw || raw.trim() === '') return ['http://localhost:5173'];
+  if (raw.trim() === '*') return '*';
+  const list = raw.split(',').map((s) => s.trim()).filter(Boolean);
+  return list.length ? list : ['http://localhost:5173'];
+}
+
 const TOKEN = process.env.TOKEN;
 if (!TOKEN) {
   // Fail fast: without a token the bridge cannot auth to units or protect /register.
@@ -28,7 +41,7 @@ export const config = {
   port: int('PORT', 8080),
   pollIntervalMs: int('POLL_INTERVAL_MS', 60_000),
   staleAfterMs: int('STALE_AFTER_MS', 15 * 60_000),
-  uiOrigin: process.env.UI_ORIGIN || 'http://localhost:5173',
+  uiOrigin: parseOrigins(process.env.UI_ORIGIN),
   // Where the registry + desired configs are persisted.
   dataFile: path.join(__dirname, '..', 'data', 'state.json'),
   // Timeout for any HTTP call the bridge makes to a unit.

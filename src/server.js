@@ -54,6 +54,24 @@ export function buildApp() {
     next();
   });
 
+  // ---- landing: friendly response when the base URL is opened in a browser -
+  app.get('/', (req, res) => {
+    res.json({
+      ok: true,
+      service: config.service,
+      version: config.version,
+      endpoints: {
+        'GET /health': "bridge liveness",
+        'GET /devices': 'all devices',
+        'GET /devices/:id': 'one device',
+        'POST /devices/:id/config': 'set desired config (validated, proxied to unit)',
+        'POST /devices/:id/identify': "blink the unit's LED",
+        'POST /devices/:id/resend': "re-transmit the unit's last config",
+        'POST /register': 'unit self-registration (requires bearer token)',
+      },
+    });
+  });
+
   // ---- bridge liveness -----------------------------------------------------
   app.get('/health', (req, res) => {
     const now = Date.now();

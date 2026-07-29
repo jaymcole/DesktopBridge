@@ -4,12 +4,19 @@ import { deviceClient } from './deviceClient.js';
 import { log } from './logger.js';
 
 // Reconciliation loop: periodically poll each known unit's /health (and /config
-// to learn its reported state). If a unit reports applied:false or a configId
-// lower than the bridge's stored desired-state configId, it rebooted or missed
-// a command — best-effort re-push the desired state. IR is fire-and-forget, so
-// re-assertion has no ACK and is expected.
+// to learn its reported state). If a *running* unit reports a configId lower
+// than the bridge's stored desired-state configId, a fire-and-forget push was
+// lost — best-effort re-push the desired state (IR has no ACK, so this is
+// expected). We do NOT re-push on reboot: the firmware is intentionally inert on
+// boot, and reasserting there would override a remote-set state and resurrect a
+// stale desiredConfig.
 
 let timer = null;
+// Guard against overlapping ticks. A single slow/hung unit poll can take up to
+// deviceTimeoutMs; without this, setInterval keeps firing every pollIntervalMs
+// and piles concurrent requests onto the (single-connection) unit, amplifying
+// the stall into a multi-second blackout. If a tick is still running, skip.
+let ticking = false;
 
 async function pollOne(entry) {
   const id = entry.id;
@@ -51,13 +58,18 @@ async function maybeReassert(entry) {
   const id = entry.id;
   if (!entry.desiredConfig || entry.desiredConfigId === null) return; // nothing to assert
 
-  const rebooted = entry.applied === false;
+  // Re-push ONLY when a running unit's configId has regressed below our desired
+  // — i.e. a push that never landed. Deliberately NOT on reboot (applied===false):
+  // the firmware stays inert on boot by design (a power blip must not turn the AC
+  // on), and reasserting there would clobber a state the user later set via the
+  // physical remote and revive a stale desiredConfig. After a reboot the unit is
+  // left as-is until the next UI push or remote press.
   const missed = entry.unitConfigId !== null && entry.unitConfigId < entry.desiredConfigId;
-  if (!rebooted && !missed) return;
+  if (!missed) return;
 
   log.info('reassert_start', {
     id,
-    reason: rebooted ? 'applied_false' : 'config_id_regressed',
+    reason: 'config_id_regressed',
     unitConfigId: entry.unitConfigId,
     desiredConfigId: entry.desiredConfigId,
   });
@@ -78,8 +90,17 @@ async function maybeReassert(entry) {
 }
 
 async function tick() {
-  const entries = allEntries();
-  await Promise.allSettled(entries.map(pollOne));
+  if (ticking) {
+    log.debug('reconcile_skip_overlap');
+    return;
+  }
+  ticking = true;
+  try {
+    const entries = allEntries();
+    await Promise.allSettled(entries.map(pollOne));
+  } finally {
+    ticking = false;
+  }
 }
 
 export function startReconcile() {

@@ -68,6 +68,7 @@ export function buildApp() {
         'POST /devices/:id/identify': "blink the unit's LED",
         'POST /devices/:id/resend': "re-transmit the unit's last config",
         'POST /register': 'unit self-registration (requires bearer token)',
+        'POST /observed': "unit-pushed state observed from its physical remote (requires bearer token)",
       },
     });
   });
@@ -105,6 +106,33 @@ export function buildApp() {
     });
     persist();
     log.info('register', { id, ip, location, configId });
+    res.json({ ok: true });
+  }));
+
+  // ---- unit-pushed observed state (from its physical remote) ---------------
+  // The unit watches the AC's original remote and pushes the decoded state here
+  // the instant a button is pressed, so the UI reflects it within a round-trip
+  // instead of waiting for the next reconcile poll. Deliberately NOT run through
+  // validateConfig: this is the unit's *reported* truth, and a physical remote
+  // can set firmware-only values (e.g. fan 'silent', mode 'fan') that the command
+  // validator rejects. It lands in reportedConfig exactly like a GET /config poll
+  // would, so the reconcile loop remains the backstop if a push is ever lost.
+  app.post('/observed', requireToken, wrap(async (req, res) => {
+    const { id, config, configId } = req.body || {};
+    if (!id || typeof id !== 'string') {
+      throw new ApiError('validation_error', 'observed requires a string "id"', { field: 'id' });
+    }
+    if (config !== undefined && config !== null
+        && (typeof config !== 'object' || Array.isArray(config))) {
+      throw new ApiError('validation_error', 'observed "config" must be an object', { field: 'config' });
+    }
+    touch(id, {
+      reportedConfig: config !== undefined ? config : undefined,
+      unitConfigId: typeof configId === 'number' ? configId : undefined,
+      applied: true,
+    });
+    persist();
+    log.info('observed', { id, configId });
     res.json({ ok: true });
   }));
 

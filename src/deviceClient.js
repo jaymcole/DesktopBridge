@@ -26,6 +26,11 @@ async function call(entry, method, pathname, { body, auth = true } = {}) {
       signal: controller.signal,
       headers: {
         ...(auth ? { Authorization: `Bearer ${config.token}` } : {}),
+        // Advertise our listening port so a unit can learn where to push
+        // (POST /observed, /register) without a hardcoded bridge address — it
+        // pairs this with the source IP of this (authenticated) request. Sent on
+        // every call; units only trust it on requests that pass auth.
+        'X-Bridge-Port': String(config.port),
         ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,

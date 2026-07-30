@@ -38,7 +38,7 @@ on startup beyond the normal loop.
 | `TOKEN`            | *(required)*             | Shared bearer token for all units + this bridge. Server-side only.  |
 | `PORT`             | `8080`                   | Port the bridge listens on (UI + unit self-registration).           |
 | `POLL_INTERVAL_MS` | `60000`                  | How often the reconciliation loop polls each unit's `GET /health`.  |
-| `STALE_AFTER_MS`   | `900000` (15 min)        | A unit not seen for this long is marked `stale`.                    |
+| `OFFLINE_AFTER_MS` | `150000` (2.5 min)       | A unit not seen for this long is marked `offline`.                  |
 | `UI_ORIGIN`        | `http://localhost:5173`  | Allowed CORS origin for the React UI (`*` allows any).              |
 | `DEVICE_TIMEOUT_MS`| `5000`                   | Timeout for any HTTP call the bridge makes to a unit.               |
 
@@ -50,7 +50,7 @@ The registry is populated from two sources, keyed by device `id`:
 2. **Self-registration** — units `POST /register` on boot and every ~5 min.
 
 `lastSeen` updates on any contact (mDNS, register, or a successful poll). A unit
-not seen for `STALE_AFTER_MS` becomes `stale`; an mDNS `down` event marks it
+not seen for `OFFLINE_AFTER_MS`, or that fires an mDNS `down` event, is marked
 `offline`. Units are never hard-deleted, so known-but-offline units stay visible.
 
 ## Reconciliation
@@ -152,7 +152,7 @@ are ISO-8601 UTC; temperatures are °C.
 }
 ```
 
-- `status`: `online` (seen within `STALE_AFTER_MS`) | `stale` (aged out) | `offline` (mDNS down / never contacted).
+- `status`: `online` (seen within `OFFLINE_AFTER_MS`) | `offline` (aged out, mDNS down, or never contacted).
 - `desiredConfig`: what the user wants (bridge intent). `reportedConfig`: what the unit says it last sent.
 - `inSync`: `unitConfigId === desiredConfigId && applied === true`. The UI shows a "drift" badge when false.
 

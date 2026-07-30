@@ -34,7 +34,7 @@ async function pollOne(entry) {
       applied: typeof health.applied === 'boolean' ? health.applied : null,
     });
   } catch (err) {
-    // Unreachable: leave lastSeen/down as-is (computeStatus will age it to stale).
+    // Unreachable: leave lastSeen/down as-is (computeStatus will age it to offline).
     log.warn('poll_health_failed', { id, error: err.message });
     return;
   }

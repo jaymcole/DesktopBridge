@@ -74,7 +74,10 @@ export function computeStatus(entry, now = Date.now()) {
   if (entry.down) return 'offline';
   if (!entry.lastSeen) return 'offline';
   const age = now - new Date(entry.lastSeen).getTime();
-  return age <= config.staleAfterMs ? 'online' : 'stale';
+  // Only two liveness states: a unit is either responding (online) or it isn't
+  // (offline). There is no separate "stale" grace band — if we miss more than
+  // one check-in the unit needs attention, so it flips straight to offline.
+  return age <= config.offlineAfterMs ? 'online' : 'offline';
 }
 
 /** Build the exact Device response shape the React UI depends on. */

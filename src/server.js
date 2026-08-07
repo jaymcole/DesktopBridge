@@ -4,9 +4,15 @@ import { config } from './config.js';
 import { log } from './logger.js';
 import { ApiError, errorBody } from './errors.js';
 import { validateConfig } from './schema.js';
+import { validateSchedule } from './scheduleSchema.js';
 import {
   getEntry, allEntries, toDevice, computeStatus, touch, upsert, persist,
 } from './store.js';
+import {
+  getSchedule, allSchedules, putSchedule, removeSchedule,
+} from './scheduleStore.js';
+import { armSchedule, disarmSchedule, schedulerStatus } from './scheduler.js';
+import { applyDeviceConfig } from './control.js';
 import { deviceClient } from './deviceClient.js';
 
 const startedAt = new Date();
@@ -67,6 +73,10 @@ export function buildApp() {
         'POST /devices/:id/config': 'set desired config (validated, proxied to unit)',
         'POST /devices/:id/identify': "blink the unit's LED",
         'POST /devices/:id/resend': "re-transmit the unit's last config",
+        'GET /schedules': 'all automated control schedules',
+        'GET /schedules/:id': 'one schedule',
+        'PUT /schedules/:id': 'upsert a schedule (validated, triggers re-armed)',
+        'DELETE /schedules/:id': 'delete a schedule and cancel its triggers',
         'POST /register': 'unit self-registration (requires bearer token)',
         'POST /observed': "unit-pushed state observed from its physical remote (requires bearer token)",
       },
@@ -86,6 +96,8 @@ export function buildApp() {
       deviceCount: devices.length,
       onlineCount,
       startedAt: startedAt.toISOString(),
+      // Automated schedules: per-schedule next-run + last-run for observability.
+      schedules: schedulerStatus(),
     });
   });
 
@@ -153,20 +165,7 @@ export function buildApp() {
   app.post('/devices/:id/config', wrap(async (req, res) => {
     const entry = requireDevice(req);
     const clean = validateConfig(req.body); // throws validation_error (400)
-
-    const unitRes = await deviceClient.postConfig(entry, clean); // throws device_* on failure
-
-    // Persist desired state as the new intent, keyed to the configId the unit assigned.
-    upsert(entry.id, {
-      desiredConfig: clean,
-      desiredConfigId: typeof unitRes.configId === 'number' ? unitRes.configId : entry.desiredConfigId,
-      unitConfigId: typeof unitRes.configId === 'number' ? unitRes.configId : entry.unitConfigId,
-      applied: true,
-    });
-    touch(entry.id);
-    persist();
-    log.info('config_pushed', { id: entry.id, configId: unitRes.configId });
-
+    await applyDeviceConfig(entry, clean);  // proxy to unit + persist; throws device_* on failure
     res.json({ ok: true, device: toDevice(entry) });
   }));
 
@@ -190,6 +189,59 @@ export function buildApp() {
     persist();
     res.json({ ok: true, configId: unitRes.configId });
   }));
+
+  // ---- UI: list schedules --------------------------------------------------
+  app.get('/schedules', (req, res) => {
+    const schedules = allSchedules();
+    res.json({ schedules, count: schedules.length });
+  });
+
+  // ---- UI: one schedule ----------------------------------------------------
+  app.get('/schedules/:id', (req, res) => {
+    const schedule = getSchedule(req.params.id);
+    if (!schedule) {
+      throw new ApiError('schedule_not_found', `no schedule with id "${req.params.id}"`);
+    }
+    res.json({ schedule });
+  });
+
+  // ---- UI: upsert a schedule (validate, persist, re-arm triggers) ----------
+  app.put('/schedules/:id', wrap(async (req, res) => {
+    const clean = validateSchedule(req.body, req.params.id); // throws 400 on bad input; enforces :id === body.id
+
+    // Referencing an unknown device does NOT fail the save — devices can be
+    // offline now and rediscovered later; the schedule just skips them per fire.
+    const unknownDevices = clean.deviceIds.filter((d) => !getEntry(d));
+    if (unknownDevices.length > 0) {
+      log.warn('schedule_unknown_devices', { id: clean.id, unknownDevices });
+    }
+
+    putSchedule(clean);
+    armSchedule(clean); // cancel + rebuild triggers so the change takes effect now
+    log.info('schedule_saved', { id: clean.id, name: clean.name, steps: clean.steps.length });
+    res.json({ schedule: clean });
+  }));
+
+  // ---- UI: create a schedule (optional alias of PUT; upsert by body.id) -----
+  app.post('/schedules', wrap(async (req, res) => {
+    const clean = validateSchedule(req.body); // id comes from the body
+    const unknownDevices = clean.deviceIds.filter((d) => !getEntry(d));
+    if (unknownDevices.length > 0) {
+      log.warn('schedule_unknown_devices', { id: clean.id, unknownDevices });
+    }
+    putSchedule(clean);
+    armSchedule(clean);
+    log.info('schedule_saved', { id: clean.id, name: clean.name, steps: clean.steps.length });
+    res.json({ schedule: clean });
+  }));
+
+  // ---- UI: delete a schedule (idempotent; cancels its triggers) ------------
+  app.delete('/schedules/:id', (req, res) => {
+    disarmSchedule(req.params.id);
+    removeSchedule(req.params.id); // deleting a missing id is not an error
+    log.info('schedule_deleted', { id: req.params.id });
+    res.json({ ok: true });
+  });
 
   // ---- 404 for unknown routes ----------------------------------------------
   app.use((req, res) => {

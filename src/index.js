@@ -1,14 +1,19 @@
 import { config } from './config.js';
 import { log } from './logger.js';
 import { load } from './store.js';
+import { load as loadSchedules } from './scheduleStore.js';
 import { buildApp } from './server.js';
 import { startDiscovery, stopDiscovery } from './discovery.js';
 import { startReconcile, stopReconcile } from './reconcile.js';
+import { startScheduler, stopScheduler } from './scheduler.js';
 
 // Load persisted intent + last-known facts. Units start marked offline until
 // the reconciliation loop actually reaches them — we do NOT push on startup
 // beyond the normal loop.
 load();
+// Load persisted schedules; triggers are armed once below (future occurrences
+// only — a fire whose time already passed while the bridge was down is skipped).
+loadSchedules();
 
 const app = buildApp();
 const server = app.listen(config.port, () => {
@@ -21,9 +26,11 @@ const server = app.listen(config.port, () => {
 
 startDiscovery();
 startReconcile();
+startScheduler();
 
 function shutdown(signal) {
   log.info('shutdown', { signal });
+  stopScheduler();
   stopReconcile();
   stopDiscovery();
   server.close(() => process.exit(0));

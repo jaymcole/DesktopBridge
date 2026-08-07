@@ -3,8 +3,12 @@
 
 export const CODES = {
   validation_error: 400,
+  invalid_schedule: 400,
+  invalid_time: 400,
+  invalid_config: 400,
   unauthorized: 401,
   device_not_found: 404,
+  schedule_not_found: 404,
   device_unreachable: 502,
   device_error: 502,
   internal_error: 500,

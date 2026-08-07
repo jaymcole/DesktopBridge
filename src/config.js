@@ -47,6 +47,9 @@ export const config = {
   uiOrigin: parseOrigins(process.env.UI_ORIGIN),
   // Where the registry + desired configs are persisted.
   dataFile: path.join(__dirname, '..', 'data', 'state.json'),
+  // Where automated control schedules are persisted (separate from device state
+  // so a schedule save never rewrites the volatile device registry).
+  schedulesFile: path.join(__dirname, '..', 'data', 'schedules.json'),
   // Timeout for any HTTP call the bridge makes to a unit.
   deviceTimeoutMs: int('DEVICE_TIMEOUT_MS', 5_000),
   version: '1.0.0',

@@ -11,8 +11,23 @@ to this bridge and never sees the token.
 ```
 React UI ──HTTP(JSON, no token)──▶  ac-bridge  ──HTTP(JSON + Bearer token)──▶  ESP32 units
                                         ▲                                         │
-                                        └──────── mDNS + POST /register ──────────┘
+                                        └── mDNS + POST /register + POST /observed ┘
 ```
+
+## System architecture (associated repositories)
+
+This bridge is the **middle tier** of a three-part system. The other two live in
+**sibling repositories**, normally checked out next to this one:
+
+| Component | Repo | Role |
+| --- | --- | --- |
+| **ac-bridge** (this) | `DesktopBridge/` | Discovers nodes, holds *desired* state, proxies UI commands to nodes, receives observed-state pushes, serves the UI. Owns the shared token. |
+| **ACController** | `ACController/` (sibling) | React/Vite UI. Talks only to this bridge; never sees the token. `src/api/bridge.ts` is the client mirror of this API. |
+| **Firmware** | `ArduinoScripts/scripts/ac_controller/` (sibling) | ESP32-S3 node on each AC. See that folder's `README.md` for endpoints/hardware. |
+
+- **Control path:** UI `POST /devices/:id/config` → bridge validates → node `POST /config` (Bearer) → node transmits IR.
+- **Observe path:** physical remote → node decodes → node `POST /observed` (Bearer) → bridge stores `reportedConfig` → UI poll shows it.
+- **Node learns the bridge's address**, not vice-versa: every request the bridge makes to a node carries an `X-Bridge-Port` header, and the node combines it with the request's source IP. So nodes have no hardcoded bridge address.
 
 ## Requirements
 
@@ -38,7 +53,7 @@ on startup beyond the normal loop.
 | `TOKEN`            | *(required)*             | Shared bearer token for all units + this bridge. Server-side only.  |
 | `PORT`             | `8080`                   | Port the bridge listens on (UI + unit self-registration).           |
 | `POLL_INTERVAL_MS` | `60000`                  | How often the reconciliation loop polls each unit's `GET /health`.  |
-| `OFFLINE_AFTER_MS` | `150000` (2.5 min)       | A unit not seen for this long is marked `offline`.                  |
+| `STALE_AFTER_MS`   | `900000` (15 min)        | A unit not seen for this long is marked `stale`. Must exceed `POLL_INTERVAL_MS`. |
 | `UI_ORIGIN`        | `http://localhost:5173`  | Allowed CORS origin for the React UI (`*` allows any).              |
 | `DEVICE_TIMEOUT_MS`| `5000`                   | Timeout for any HTTP call the bridge makes to a unit.               |
 
@@ -56,11 +71,52 @@ not seen for `OFFLINE_AFTER_MS`, or that fires an mDNS `down` event, is marked
 ## Reconciliation
 
 Every `POLL_INTERVAL_MS` the bridge polls each unit's `GET /health` (and
-`GET /config` to learn the unit's reported state). If a unit reports
-`applied:false` or a `configId` **lower** than the bridge's stored desired-state
-`configId`, it rebooted or missed a command — the bridge re-pushes the stored
-desired config. IR is fire-and-forget (no ACK), so this best-effort re-assertion
-is expected. These events are logged (`reassert_start` / `reassert_ok` / `reassert_failed`).
+`GET /config` to learn the unit's reported state). If a **running** unit reports a
+`configId` **lower** than the bridge's stored desired-state `configId`, a
+fire-and-forget push was lost — the bridge best-effort re-pushes the desired
+config (IR has no ACK, so this is expected). These events are logged
+(`reassert_start` / `reassert_ok` / `reassert_failed`).
+
+The bridge deliberately does **not** re-assert on reboot (`applied:false`): the
+firmware is intentionally inert on boot (a power blip must not turn the AC on),
+and re-pushing there would override a state the user set via the physical remote
+and resurrect a stale `desiredConfig`. After a reboot a unit is left as-is until
+the next UI push or remote press.
+
+## Schedules (automated control)
+
+The bridge can run **schedules**: a named, ordered list of *steps*, where each
+step is a full schema-v1 config transmitted to a chosen set of devices at a time
+of day. Schedules are created/edited by the React UI and executed by the bridge.
+
+- **Recurrence: daily.** A step's `time` is `"HH:MM"` (24h) only — no date, no
+  day-of-week — and fires **every day** at that time. (Per-step day-of-week is a
+  natural future extension; the model leaves room for it but it isn't implemented.)
+- **Timezone: the bridge host's local time.** `07:00` means 07:00 wherever the
+  bridge runs. **DST-safe:** the next fire is recomputed from the wall clock each
+  day (local-time date math), not by adding a fixed 24h interval, so a step never
+  drifts an hour across a spring-forward / fall-back.
+- **Missed fires are skipped, not replayed.** If the bridge is down at a step's
+  time, that occurrence is lost; on boot only *future* occurrences are armed.
+- **Execution reuses the manual push path.** At fire time each device in the
+  schedule takes the exact same internal route as `POST /devices/:id/config`
+  (validate → proxy to unit → update desired state → persist). **Per-device
+  failures are isolated:** an offline/unreachable device is logged and skipped;
+  the others in the step still update. Last-write-wins, same as manual control.
+- **Live re-arm.** Saving or deleting a schedule cancels and rebuilds its
+  triggers immediately — no restart needed.
+- **Persistence.** Schedules are stored in `data/schedules.json` (atomic write,
+  same pattern as `data/state.json`) and reloaded + re-armed on startup. Each
+  step's config is re-validated on load; an invalid one is skipped with a warning.
+- **Validation.** Writes are validated with a closed shape (unknown keys
+  rejected). Each `time` must match `^([01]\d|2[0-3]):[0-5]\d$`; each step config
+  passes the same schema-v1 validator as a device push (so e.g. `mode:"fan"` is
+  rejected). Referencing a currently-unknown device does **not** fail the save —
+  devices can be offline now and rediscovered later; the schedule just skips them
+  per fire and logs a warning.
+- **Observability.** Each fire logs `schedule_fire` plus a per-device
+  `schedule_device_ok` / `schedule_device_failed`. `GET /health` includes a
+  `schedules` array with each schedule's `nextRunAt` and `lastRun`.
 
 ## Bridge HTTP API (for the React UI)
 
@@ -116,11 +172,77 @@ keys / out-of-range `temp` with `400`) **before** proxying to the unit's
 { "ok": true, "configId": 8 }
 ```
 
+### `GET /schedules` — all schedules
+
+```json
+{ "schedules": [ /* Schedule objects */ ], "count": 2 }
+```
+
+### `GET /schedules/:id` — one schedule
+
+```json
+{ "schedule": { /* Schedule */ } }
+```
+
+`404 schedule_not_found` for an unknown id.
+
+### `PUT /schedules/:id` — upsert a schedule
+
+Body is a `Schedule` (`{ id, name, deviceIds, steps }`); `:id` **must** equal
+`body.id`. The bridge validates it, persists it, and (re)arms its triggers, then
+returns the persisted schedule.
+
+```json
+{ "schedule": { /* persisted Schedule */ } }
+```
+
+- Bad time → `400 invalid_time`; bad step config → `400 invalid_config`; other
+  shape problems (unknown key, id mismatch, wrong types) → `400 invalid_schedule`.
+- `POST /schedules` is also accepted as an upsert alias (id comes from the body).
+
+### `DELETE /schedules/:id` — delete a schedule
+
+Deletes it and cancels its triggers. Idempotent — deleting an unknown id is not
+an error.
+
+```json
+{ "ok": true }
+```
+
+### The `Schedule` object
+
+```jsonc
+{
+  "id": "b1f2…",              // client-generated uuid; the resource id
+  "name": "Weekday mornings",
+  "deviceIds": ["ac-basement", "ac-office"],
+  "steps": [
+    {
+      "id": "3c4d…",          // client-generated uuid
+      "time": "07:00",        // 24h HH:MM, bridge host local time, fires daily
+      "config": { "schema": 1, "power": "on", "mode": "heat", "temp": 22 }
+    }
+  ]
+}
+```
+
 ### `POST /register` — unit self-registration (**requires bearer token**)
 
 Called by units, not the UI. Body: `{ id, location, ip, firmware, schema, configId }`.
 An optional `port` is also accepted, letting a unit that only self-registers
 (no mDNS) advertise a non-80 HTTP port; if omitted the bridge assumes port 80.
+
+```json
+{ "ok": true }
+```
+
+### `POST /observed` — unit-pushed observed state (**requires bearer token**)
+
+Called by a unit the instant it decodes a command from the AC's **physical
+remote**, so the UI reflects it within a round-trip instead of waiting for the
+next poll. Body: `{ id, configId, config }`. The `config` is stored as
+`reportedConfig` and is **not** run through the config validator (a remote can
+set firmware-only values like `fan:"silent"` that a push would reject).
 
 ```json
 { "ok": true }
@@ -152,8 +274,8 @@ are ISO-8601 UTC; temperatures are °C.
 }
 ```
 
-- `status`: `online` (seen within `OFFLINE_AFTER_MS`) | `offline` (aged out, mDNS down, or never contacted).
-- `desiredConfig`: what the user wants (bridge intent). `reportedConfig`: what the unit says it last sent.
+- `status`: `online` (seen within `STALE_AFTER_MS`) | `stale` (not seen for longer, but known) | `offline` (mDNS `down` or never contacted).
+- `desiredConfig`: what the user wants (bridge intent, set by UI pushes). `reportedConfig`: the unit's actual last state (from polls **and** `/observed` remote captures).
 - `inSync`: `unitConfigId === desiredConfigId && applied === true`. The UI shows a "drift" badge when false.
 
 ## Config schema v1
@@ -181,7 +303,7 @@ Every non-2xx bridge response:
 | `code`               | HTTP | Meaning                                                        |
 | -------------------- | ---- | ------------------------------------------------------------- |
 | `validation_error`   | 400  | Bad input to the bridge (unknown key, out-of-range value).    |
-| `unauthorized`       | 401  | Missing/invalid bearer token (on `/register`).                |
+| `unauthorized`       | 401  | Missing/invalid bearer token (on `/register`, `/observed`).   |
 | `device_not_found`   | 404  | Unknown device id / unknown route.                            |
 | `device_unreachable` | 502  | Proxied unit didn't answer (timeout / connection refused).    |
 | `device_error`       | 502  | Unit answered but rejected the request; its message in `details`. |

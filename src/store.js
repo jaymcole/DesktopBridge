@@ -8,7 +8,8 @@ import { log } from './logger.js';
 // {
 //   id, location, firmware, schema, ip, port,
 //   lastSeen: ISO string | null,
-//   down: bool,                      // set by an mDNS "down" event
+//   down: bool,                      // last mDNS "down" signal (advisory only —
+//                                    // computeStatus trusts lastSeen, not this)
 //   // learned from the unit's GET /health:
 //   rssi, uptimeSec, unitConfigId, applied,
 //   // learned from the unit's GET /config:
@@ -71,12 +72,15 @@ export function touch(id, fields = {}) {
 }
 
 export function computeStatus(entry, now = Date.now()) {
-  if (entry.down) return 'offline';
   if (!entry.lastSeen) return 'offline';
   const age = now - new Date(entry.lastSeen).getTime();
-  // Only two liveness states: a unit is either responding (online) or it isn't
-  // (offline). There is no separate "stale" grace band — if we miss more than
-  // one check-in the unit needs attention, so it flips straight to offline.
+  // Reachability is authoritative. A successful poll/observe within this window
+  // is direct proof the unit is up, so it always wins — we deliberately do NOT
+  // let the mDNS `down` flag veto it. mDNS records flap on TTL expiry / missed
+  // refreshes, so an actively (and successfully) polled unit would otherwise
+  // oscillate to "offline" between polls despite excellent signal and climbing
+  // uptime. If the unit is genuinely gone, polls stop refreshing lastSeen and it
+  // ages out to offline on its own — no separate "stale" grace band.
   return age <= config.offlineAfterMs ? 'online' : 'offline';
 }
 
@@ -144,8 +148,11 @@ export function load() {
     for (const d of parsed.devices ?? []) {
       if (!d.id) continue;
       // Restore intent + last-known facts, but never trust volatile liveness:
-      // force offline until the reconciliation loop actually reaches the unit.
-      const entry = { ...blankEntry(d.id), ...d, down: true };
+      // drop the restored lastSeen so the unit reads offline until the
+      // reconciliation loop actually reaches it and refreshes the timestamp.
+      // (We no longer rely on `down` for this — computeStatus treats a fresh
+      // lastSeen as authoritative, so a stale restored one must not look fresh.)
+      const entry = { ...blankEntry(d.id), ...d, lastSeen: null, down: true };
       registry.set(d.id, entry);
     }
     log.info('state_loaded', { file: config.dataFile, deviceCount: registry.size });

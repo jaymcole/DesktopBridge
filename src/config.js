@@ -50,6 +50,9 @@ export const config = {
   // Where automated control schedules are persisted (separate from device state
   // so a schedule save never rewrites the volatile device registry).
   schedulesFile: path.join(__dirname, '..', 'data', 'schedules.json'),
+  // Append-only audit log of every command pushed to a unit (JSON-lines), for
+  // later review. Not exposed via the API yet; the per-device "last command" is.
+  commandLogFile: path.join(__dirname, '..', 'data', 'commands.jsonl'),
   // Timeout for any HTTP call the bridge makes to a unit.
   deviceTimeoutMs: int('DEVICE_TIMEOUT_MS', 5_000),
   version: '1.0.0',

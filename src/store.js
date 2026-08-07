@@ -37,6 +37,9 @@ function blankEntry(id) {
     reportedConfig: null,
     desiredConfig: null,
     desiredConfigId: null,
+    // Most recent command initiated against this unit: { source, at } (or null).
+    // Surfaced to the UI's info pane; the full history lives in the command log.
+    lastCommand: null,
   };
 }
 
@@ -111,6 +114,7 @@ export function toDevice(entry, now = Date.now()) {
     applied,
     desiredConfig: entry.desiredConfig,
     reportedConfig: entry.reportedConfig,
+    lastCommand: entry.lastCommand,
   };
 }
 

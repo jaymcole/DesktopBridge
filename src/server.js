@@ -165,7 +165,9 @@ export function buildApp() {
   app.post('/devices/:id/config', wrap(async (req, res) => {
     const entry = requireDevice(req);
     const clean = validateConfig(req.body); // throws validation_error (400)
-    await applyDeviceConfig(entry, clean);  // proxy to unit + persist; throws device_* on failure
+    // Optional ?source= tags what initiated the command in the audit log
+    // (e.g. "manual" vs "manual_immediate"); unknown/absent → "manual".
+    await applyDeviceConfig(entry, clean, req.query.source); // proxy to unit + persist; throws device_* on failure
     res.json({ ok: true, device: toDevice(entry) });
   }));
 

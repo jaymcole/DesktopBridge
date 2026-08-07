@@ -78,7 +78,7 @@ async function fireStep(scheduleId, stepId) {
       continue;
     }
     try {
-      const res = await applyDeviceConfig(entry, step.config);
+      const res = await applyDeviceConfig(entry, step.config, 'scheduled', { scheduleId, stepId });
       log.info('schedule_device_ok', { scheduleId, stepId, deviceId, configId: res.configId });
       results.push({ deviceId, ok: true, configId: res.configId ?? null });
     } catch (err) {

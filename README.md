@@ -153,6 +153,12 @@ Body is a schema-v1 config object. The bridge validates it (rejecting unknown
 keys / out-of-range `temp` with `400`) **before** proxying to the unit's
 `POST /config` with the token attached, then stores it as desired state.
 
+An optional `?source=` query tags what initiated the command for the audit log
+(`manual` — a Controllers-page control, the default; `manual_immediate` — a
+schedule step's "send now"; `scheduled` — the scheduler). Unknown/absent values
+default to `manual`. Scheduled fires use the same internal path with
+`source=scheduled`. See [Command log](#command-log).
+
 ```json
 { "ok": true, "device": { /* updated Device */ } }
 ```
@@ -270,11 +276,13 @@ are ISO-8601 UTC; temperatures are °C.
   "inSync": true,
   "applied": true,
   "desiredConfig": { "schema": 1, "power": "on", "mode": "cool", "temp": 21, "fan": "auto", "vaneVert": "auto", "vaneHoriz": "auto" },
-  "reportedConfig": { "schema": 1, "power": "on", "mode": "cool", "temp": 21, "fan": "auto", "vaneVert": "auto", "vaneHoriz": "auto" }
+  "reportedConfig": { "schema": 1, "power": "on", "mode": "cool", "temp": 21, "fan": "auto", "vaneVert": "auto", "vaneHoriz": "auto" },
+  "lastCommand": { "source": "scheduled", "at": "2026-07-24T18:30:12Z" }
 }
 ```
 
 - `status`: `online` (seen within `STALE_AFTER_MS`) | `stale` (not seen for longer, but known) | `offline` (mDNS `down` or never contacted).
+- `lastCommand`: the most recent command initiated against this unit (`source` + ISO `at`), or `null`. Reflects the last *initiated* command, success or not. Full history is in the [command log](#command-log).
 - `desiredConfig`: what the user wants (bridge intent, set by UI pushes). `reportedConfig`: the unit's actual last state (from polls **and** `/observed` remote captures).
 - `inSync`: `unitConfigId === desiredConfigId && applied === true`. The UI shows a "drift" badge when false.
 
@@ -308,6 +316,17 @@ Every non-2xx bridge response:
 | `device_unreachable` | 502  | Proxied unit didn't answer (timeout / connection refused).    |
 | `device_error`       | 502  | Unit answered but rejected the request; its message in `details`. |
 | `internal_error`     | 500  | Unexpected bridge failure.                                    |
+
+## Command log
+
+Every command pushed to a unit is appended to `data/commands.jsonl` (JSON-lines,
+append-only), for later review. Each record carries the initiation time, target
+device, `source` (`manual` | `manual_immediate` | `scheduled`), the config sent,
+whether the unit accepted it (`ok`), the assigned `configId` (on success) or
+`error` (on failure), and — for scheduled fires — the `scheduleId`/`stepId`. The
+per-device `lastCommand` (source + time) is surfaced in `GET /devices`; the full
+log is **not** exposed via the API yet. Automatic reconcile re-asserts are not
+logged (they aren't user/scheduler-initiated commands).
 
 ## Logging
 

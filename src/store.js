@@ -103,9 +103,15 @@ export function upsert(id, fields = {}) {
   return entry;
 }
 
-/** Record any contact with a unit: updates lastSeen and clears the down flag. */
+/** Record any contact with a unit: updates lastSeen and clears the down flag.
+ * Also immediately drops any other entry left sharing this ip — this entry's
+ * live contact makes it the freshest, so a same-ip sibling is a stale
+ * duplicate (an old id from before a rename/reflash) rather than a distinct
+ * unit. Callers persist as usual; this doesn't add an extra write. */
 export function touch(id, fields = {}) {
-  return upsert(id, { ...fields, lastSeen: new Date().toISOString(), down: false });
+  const entry = upsert(id, { ...fields, lastSeen: new Date().toISOString(), down: false });
+  if (entry.ip) pruneDuplicateIps();
+  return entry;
 }
 
 export function computeStatus(entry, now = Date.now()) {

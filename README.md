@@ -66,7 +66,30 @@ The registry is populated from two sources, keyed by device `id`:
 
 `lastSeen` updates on any contact (mDNS, register, or a successful poll). A unit
 not seen for `OFFLINE_AFTER_MS`, or that fires an mDNS `down` event, is marked
-`offline`. Units are never hard-deleted, so known-but-offline units stay visible.
+`offline`. Units are never automatically hard-deleted just for going offline,
+so known-but-offline units stay visible — but see "Duplicate entries" below for
+the one case where an entry *is* removed automatically.
+
+### Duplicate entries (renamed/reflashed units)
+
+Renaming a unit (giving it a new `id`, e.g. to match its real-world location)
+leaves its old id behind in the registry as a separate entry — same ip, same
+everything, since it's the same physical unit. Left alone this looks like a
+permanent duplicate, because the reconciliation loop polls every known entry's
+`GET /health` by ip: the still-reachable unit answers for **both** the old and
+new id's poll, refreshing `lastSeen` on the stale entry forever instead of
+letting it age out to offline.
+
+The bridge closes this automatically: a unit's `/health` response includes its
+own id, and if it doesn't match the entry being polled, that entry is the
+orphaned old id and is removed on the spot (`reconcile.js`). As a
+belt-and-suspenders fallback (e.g. a stale entry that never answers a poll to
+report the mismatch), each reconciliation tick also prunes any entries that
+still share an ip, keeping whichever was seen most recently. Existing
+duplicates clean themselves up within one `POLL_INTERVAL_MS` of upgrading.
+
+For manual cleanup (or to force it immediately) use `POST /devices/dedupe` or
+`DELETE /devices/:id` — see the API reference below.
 
 ## Reconciliation
 
@@ -146,6 +169,28 @@ every non-2xx uses the uniform error shape below. CORS is enabled for `UI_ORIGIN
 ### `GET /devices/:id` — one device
 
 Returns a bare `Device` object (not wrapped). `404 device_not_found` for unknown ids.
+
+### `DELETE /devices/:id` — remove a device entry
+
+Manually removes a device entry from the registry — e.g. a stale duplicate left
+behind after a unit was renamed/reflashed with a new id. Idempotent — removing
+an unknown id is not an error.
+
+```json
+{ "ok": true, "removed": true }
+```
+
+### `POST /devices/dedupe` — remove duplicate entries sharing an ip
+
+A unit is stationary at one ip, so two entries sharing an ip are always the
+same physical unit registered under more than one id, never two distinct
+units. This scans the registry and removes all but the most-recently-seen
+entry per shared ip. Usually unnecessary — see "Duplicate entries" below —
+but useful to force an immediate cleanup.
+
+```json
+{ "ok": true, "removed": ["ac-old-id"] }
+```
 
 ### `POST /devices/:id/config` — set desired config
 

@@ -1,5 +1,7 @@
 import { config } from './config.js';
-import { allEntries, touch, upsert, persist } from './store.js';
+import {
+  allEntries, touch, upsert, persist, removeEntry, pruneDuplicateIps,
+} from './store.js';
 import { deviceClient } from './deviceClient.js';
 import { log } from './logger.js';
 
@@ -22,6 +24,17 @@ async function pollOne(entry) {
   const id = entry.id;
   try {
     const health = await deviceClient.health(entry);
+    // The unit reports its own id in /health. If it no longer matches this
+    // entry's id, the unit at this ip was renamed/reflashed and this entry is
+    // the orphaned leftover of its old id — drop it instead of refreshing
+    // lastSeen, which would otherwise keep a duplicate alive forever (the
+    // still-reachable unit answering health checks under its new identity).
+    if (health.id && health.id !== id) {
+      log.info('device_id_changed', { staleId: id, currentId: health.id, ip: entry.ip });
+      removeEntry(id);
+      persist();
+      return;
+    }
     // Any successful contact refreshes liveness.
     touch(id, {
       location: health.location ?? undefined,
@@ -96,6 +109,11 @@ async function tick() {
   }
   ticking = true;
   try {
+    // Belt-and-suspenders: catch any same-ip duplicates the per-poll id check
+    // in pollOne wouldn't (e.g. a stale entry whose unit never answers, so it
+    // never gets the chance to report a changed id) before polling this tick.
+    const pruned = pruneDuplicateIps();
+    if (pruned.length > 0) persist();
     const entries = allEntries();
     await Promise.allSettled(entries.map(pollOne));
   } finally {

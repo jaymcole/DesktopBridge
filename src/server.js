@@ -7,6 +7,7 @@ import { validateConfig } from './schema.js';
 import { validateSchedule } from './scheduleSchema.js';
 import {
   getEntry, allEntries, toDevice, computeStatus, touch, upsert, persist,
+  removeEntry, pruneDuplicateIps,
 } from './store.js';
 import {
   getSchedule, allSchedules, putSchedule, removeSchedule,
@@ -70,6 +71,8 @@ export function buildApp() {
         'GET /health': "bridge liveness",
         'GET /devices': 'all devices',
         'GET /devices/:id': 'one device',
+        'DELETE /devices/:id': 'remove a stale/duplicate device entry',
+        'POST /devices/dedupe': 'remove duplicate entries sharing an ip, keeping the most recently seen',
         'POST /devices/:id/config': 'set desired config (validated, proxied to unit)',
         'POST /devices/:id/identify': "blink the unit's LED",
         'POST /devices/:id/resend': "re-transmit the unit's last config",
@@ -159,6 +162,26 @@ export function buildApp() {
   app.get('/devices/:id', (req, res) => {
     const entry = requireDevice(req);
     res.json(toDevice(entry));
+  });
+
+  // ---- UI: remove a stale/duplicate device entry ---------------------------
+  // Idempotent — removing an unknown id is not an error (nothing to remove).
+  app.delete('/devices/:id', (req, res) => {
+    const removed = removeEntry(req.params.id);
+    if (removed) persist();
+    log.info('device_removed', { id: req.params.id, removed });
+    res.json({ ok: true, removed });
+  });
+
+  // ---- UI: remove duplicate entries sharing an ip --------------------------
+  // A unit is stationary at one ip, so entries sharing an ip are always the
+  // same physical unit left registered under more than one id (e.g. after a
+  // rename/reflash). Keeps whichever entry per ip was seen most recently.
+  app.post('/devices/dedupe', (req, res) => {
+    const removed = pruneDuplicateIps();
+    if (removed.length > 0) persist();
+    log.info('devices_deduped', { removed });
+    res.json({ ok: true, removed });
   });
 
   // ---- UI: set desired config (validate on bridge, then proxy to unit) -----

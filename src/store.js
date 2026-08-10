@@ -51,6 +51,40 @@ export function allEntries() {
   return [...registry.values()];
 }
 
+/** Hard-delete a device entry (e.g. a stale id left behind after a unit was
+ * renamed/reflashed). Returns whether it existed. Does not persist. */
+export function removeEntry(id) {
+  return registry.delete(id);
+}
+
+/**
+ * Find entries that share an ip address with another entry and remove all but
+ * the most recently seen one. Units are stationary with a fixed ip, so a
+ * shared ip always means the same physical unit under more than one id (e.g.
+ * left behind after a rename/reflash) — never two distinct units. Returns the
+ * removed ids. Does not persist.
+ */
+export function pruneDuplicateIps() {
+  const byIp = new Map();
+  for (const entry of registry.values()) {
+    if (!entry.ip) continue;
+    if (!byIp.has(entry.ip)) byIp.set(entry.ip, []);
+    byIp.get(entry.ip).push(entry);
+  }
+  const removed = [];
+  for (const entries of byIp.values()) {
+    if (entries.length < 2) continue;
+    entries.sort((a, b) => new Date(b.lastSeen ?? 0) - new Date(a.lastSeen ?? 0));
+    const [keep, ...stale] = entries;
+    for (const entry of stale) {
+      registry.delete(entry.id);
+      removed.push(entry.id);
+      log.info('device_duplicate_removed', { removedId: entry.id, keptId: keep.id, ip: entry.ip });
+    }
+  }
+  return removed;
+}
+
 /**
  * Merge fields into a device entry, creating it if needed. Only defined values
  * overwrite existing ones, so partial updates from different sources compose.

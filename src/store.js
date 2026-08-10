@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { config } from './config.js';
 import { log } from './logger.js';
+import { removeDeviceFromSchedules } from './scheduleStore.js';
 
 // In-memory device registry, keyed by device id, persisted to a JSON file.
 // Each entry:
@@ -52,9 +53,17 @@ export function allEntries() {
 }
 
 /** Hard-delete a device entry (e.g. a stale id left behind after a unit was
- * renamed/reflashed). Returns whether it existed. Does not persist. */
+ * renamed/reflashed). Also drops the id from any schedule that still
+ * references it, so a renamed/removed device can't leave schedules failing
+ * on a ghost id forever. Returns whether it existed. Does not persist (the
+ * schedule-store prune persists itself, on its own file). */
 export function removeEntry(id) {
-  return registry.delete(id);
+  const existed = registry.delete(id);
+  if (existed) {
+    const affected = removeDeviceFromSchedules(id);
+    if (affected.length > 0) log.info('schedule_device_pruned', { deviceId: id, scheduleIds: affected });
+  }
+  return existed;
 }
 
 /**
@@ -80,6 +89,8 @@ export function pruneDuplicateIps() {
       registry.delete(entry.id);
       removed.push(entry.id);
       log.info('device_duplicate_removed', { removedId: entry.id, keptId: keep.id, ip: entry.ip });
+      const affected = removeDeviceFromSchedules(entry.id);
+      if (affected.length > 0) log.info('schedule_device_pruned', { deviceId: entry.id, scheduleIds: affected });
     }
   }
   return removed;

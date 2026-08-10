@@ -39,6 +39,24 @@ export function removeSchedule(id) {
   return existed;
 }
 
+/**
+ * Drop a device id from every schedule's deviceIds, e.g. once its registry
+ * entry is gone for good (deleted, deduped, or reconciled away after a
+ * rename). Leaves the schedule itself in place — even with zero devices left,
+ * its name/steps are still meaningful config the user may reassign later.
+ * Returns the ids of schedules that were changed.
+ */
+export function removeDeviceFromSchedules(deviceId) {
+  const affected = [];
+  for (const schedule of schedules.values()) {
+    if (!schedule.deviceIds.includes(deviceId)) continue;
+    schedule.deviceIds = schedule.deviceIds.filter((d) => d !== deviceId);
+    affected.push(schedule.id);
+  }
+  if (affected.length > 0) persist();
+  return affected;
+}
+
 // ---- persistence -----------------------------------------------------------
 
 let persistTimer = null;

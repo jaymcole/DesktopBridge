@@ -137,6 +137,13 @@ of day. Schedules are created/edited by the React UI and executed by the bridge.
   rejected). Referencing a currently-unknown device does **not** fail the save —
   devices can be offline now and rediscovered later; the schedule just skips them
   per fire and logs a warning.
+- **Device removal prunes schedules.** When a device's registry entry is
+  deleted for good — via `DELETE /devices/:id`, dedup (`POST /devices/dedupe`
+  or the automatic same-ip prune), or a rename/reflash reconciled away — its id
+  is removed from every schedule's `deviceIds`. This is different from the
+  unknown/offline case above: an entry that's merely offline is left alone
+  since it may come back; an entry that's gone from the registry never will,
+  so schedules stop referencing it rather than failing on it forever.
 - **Observability.** Each fire logs `schedule_fire` plus a per-device
   `schedule_device_ok` / `schedule_device_failed`. `GET /health` includes a
   `schedules` array with each schedule's `nextRunAt` and `lastRun`.

@@ -57,6 +57,8 @@ async function call(entry, method, pathname, { body, auth = true } = {}) {
 
   if (res.status === 401) {
     // The bridge's own token was rejected by the unit — a config problem, not a UI auth issue.
+    // TEMP DEBUG: prints the token being sent (JSON-stringified so hidden whitespace/CRLF is visible). Remove once the mismatch is resolved.
+    console.error(`[deviceClient] token rejected by ${entry.id}; bridge sent TOKEN=${JSON.stringify(config.token)}`);
     throw new ApiError('device_error', `unit ${entry.id} rejected bridge token (401)`, data?.error ?? null);
   }
   if (!res.ok || (data && data.ok === false)) {

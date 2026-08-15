@@ -30,12 +30,25 @@ startScheduler();
 
 function shutdown(signal) {
   log.info('shutdown', { signal });
+  // Backstop first, so that whatever else throws below, this process still exits. It used to be
+  // scheduled last, which meant an error during teardown could leave the bridge running forever.
+  setTimeout(() => process.exit(0), 3_000).unref();
+
   stopScheduler();
   stopReconcile();
   stopDiscovery();
+
   server.close(() => process.exit(0));
-  // Force-exit if connections linger.
-  setTimeout(() => process.exit(0), 3_000).unref();
+  // close() drops idle keep-alive sockets by itself, but it *waits* for any request still in
+  // flight — and with the UI polling through the HouseGraph proxy there often is one. When that
+  // happened the callback above never ran, the backstop took the full 3s, and the port stayed
+  // bound that whole time; whatever HouseGraph started next hit EADDRINUSE and died. Measured:
+  // in-flight + plain close() never completes, the same case with this line completes in ~1ms.
+  //
+  // It aborts those requests, which is the right trade at shutdown — the backstop was killing
+  // them anyway 3s later, just with a hung client instead of a closed socket.
+  // Needs Node >= 18.2 (see engines in package.json).
+  server.closeAllConnections();
 }
 
 process.on('SIGINT', () => shutdown('SIGINT'));

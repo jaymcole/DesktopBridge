@@ -148,6 +148,40 @@ of day. Schedules are created/edited by the React UI and executed by the bridge.
   `schedule_device_ok` / `schedule_device_failed`. `GET /health` includes a
   `schedules` array with each schedule's `nextRunAt` and `lastRun`.
 
+### Outdoor-unit conflicts
+
+Multi-zone minisplits often wire several indoor heads to one shared outdoor
+(condenser) unit, which can only run **heat** or **cool** at a time — whichever
+head calls for a direction first "wins" it, and a sibling head asking for the
+opposite direction is simply ignored by the hardware until the winner backs
+off. That means a scheduled `cool` can silently do nothing if a sibling head
+sharing the same outdoor unit is already running `heat`.
+
+- **Grouping.** A device can be assigned to an `outdoorUnit` group (a free-text
+  id) via `POST /devices/:id/outdoor-unit`. This isn't learned automatically —
+  the bridge has no way to discover the physical wiring — so it must be set
+  once per device. Devices with no `outdoorUnit` set are never checked for
+  conflicts.
+- **Resolution: schedules win.** When a scheduled step pushes `heat` (or
+  `cool`/`dry`, which shares the compressor's cooling side) to a device, the
+  bridge checks every other device in the same `outdoorUnit` group. If a
+  sibling is currently running the opposite direction — judged from its
+  `reportedConfig` if known, else its `desiredConfig` — the bridge turns that
+  sibling off (`power: "off"`) immediately after the scheduled push, so the
+  schedule's intent actually takes effect. `mode: "auto"` is never treated as
+  either direction, since the unit picks it dynamically and the bridge can't
+  know which way it went.
+- **Scope.** Only devices *not* targeted by the same step are checked — a
+  step is free to set several of its own devices at once without them being
+  treated as conflicting with each other. This check only runs for scheduled
+  fires, not manual `POST /devices/:id/config` pushes.
+- **Observability.** A detected conflict logs `schedule_conflict_detected`,
+  then `schedule_conflict_resolved` on success or
+  `schedule_conflict_resolve_failed` on failure (best-effort — a failed
+  turn-off is logged, not thrown, and never aborts the rest of the step). The
+  turn-off itself is a normal `scheduled`-source command, so it appears in the
+  [command log](#command-log) like any other push, tagged with `conflictWith`.
+
 ## Bridge HTTP API (for the React UI)
 
 All responses are JSON. Success bodies include `"ok": true` (where wrapped);
@@ -217,6 +251,17 @@ default to `manual`. Scheduled fires use the same internal path with
 
 - Unit rejected the config → `502 device_error`, unit's own message in `error.details`.
 - Unit didn't answer → `502 device_unreachable`.
+
+### `POST /devices/:id/outdoor-unit` — assign/clear the shared outdoor-unit group
+
+Body: `{ "outdoorUnit": "condenser-a" }` (non-empty string), or `{ "outdoorUnit": null }`
+to clear it. Used by the scheduler to detect and resolve heat/cool conflicts
+between indoor heads sharing one outdoor unit — see
+[Outdoor-unit conflicts](#outdoor-unit-conflicts).
+
+```json
+{ "ok": true, "device": { /* updated Device */ } }
+```
 
 ### `POST /devices/:id/identify` — blink the unit's LED
 
@@ -329,7 +374,8 @@ are ISO-8601 UTC; temperatures are °C.
   "applied": true,
   "desiredConfig": { "schema": 1, "power": "on", "mode": "cool", "temp": 21, "fan": "auto", "vaneVert": "auto", "vaneHoriz": "auto" },
   "reportedConfig": { "schema": 1, "power": "on", "mode": "cool", "temp": 21, "fan": "auto", "vaneVert": "auto", "vaneHoriz": "auto" },
-  "lastCommand": { "source": "scheduled", "at": "2026-07-24T18:30:12Z" }
+  "lastCommand": { "source": "scheduled", "at": "2026-07-24T18:30:12Z" },
+  "outdoorUnit": "condenser-a"
 }
 ```
 
@@ -337,6 +383,7 @@ are ISO-8601 UTC; temperatures are °C.
 - `lastCommand`: the most recent command initiated against this unit (`source` + ISO `at`), or `null`. Reflects the last *initiated* command, success or not. Full history is in the [command log](#command-log).
 - `desiredConfig`: what the user wants (bridge intent, set by UI pushes). `reportedConfig`: the unit's actual last state (from polls **and** `/observed` remote captures).
 - `inSync`: `unitConfigId === desiredConfigId && applied === true`. The UI shows a "drift" badge when false.
+- `outdoorUnit`: the shared outdoor/condenser unit group this device belongs to, or `null` if unset. Set via [`POST /devices/:id/outdoor-unit`](#post-devicesidoutdoor-unit--assignclear-the-shared-outdoor-unit-group). See [Outdoor-unit conflicts](#outdoor-unit-conflicts).
 
 ## Config schema v1
 

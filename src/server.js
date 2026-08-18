@@ -74,6 +74,7 @@ export function buildApp() {
         'DELETE /devices/:id': 'remove a stale/duplicate device entry',
         'POST /devices/dedupe': 'remove duplicate entries sharing an ip, keeping the most recently seen',
         'POST /devices/:id/config': 'set desired config (validated, proxied to unit)',
+        'POST /devices/:id/outdoor-unit': 'assign/clear the shared outdoor-unit group used for schedule conflict resolution',
         'POST /devices/:id/identify': "blink the unit's LED",
         'POST /devices/:id/resend': "re-transmit the unit's last config",
         'GET /schedules': 'all automated control schedules',
@@ -193,6 +194,24 @@ export function buildApp() {
     await applyDeviceConfig(entry, clean, req.query.source); // proxy to unit + persist; throws device_* on failure
     res.json({ ok: true, device: toDevice(entry) });
   }));
+
+  // ---- UI: assign/clear a device's shared outdoor-unit group ---------------
+  // Multi-zone minisplits often wire several indoor heads to one outdoor
+  // (condenser) unit, which can only run heat or cool at a time. Grouping
+  // devices this way lets the scheduler detect and resolve heat/cool
+  // conflicts between them (see conflict.js). Not learned automatically —
+  // assigned manually since the bridge has no way to discover the wiring.
+  app.post('/devices/:id/outdoor-unit', (req, res) => {
+    const entry = requireDevice(req);
+    const { outdoorUnit } = req.body || {};
+    if (outdoorUnit !== null && (typeof outdoorUnit !== 'string' || outdoorUnit === '')) {
+      throw new ApiError('validation_error', 'outdoorUnit must be a non-empty string or null', { field: 'outdoorUnit' });
+    }
+    upsert(entry.id, { outdoorUnit });
+    persist();
+    log.info('device_outdoor_unit_set', { id: entry.id, outdoorUnit });
+    res.json({ ok: true, device: toDevice(entry) });
+  });
 
   // ---- UI: identify --------------------------------------------------------
   app.post('/devices/:id/identify', wrap(async (req, res) => {

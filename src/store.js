@@ -16,7 +16,9 @@ import { removeDeviceFromSchedules } from './scheduleStore.js';
 //   // learned from the unit's GET /config:
 //   reportedConfig,
 //   // the bridge's intent:
-//   desiredConfig, desiredConfigId
+//   desiredConfig, desiredConfigId,
+//   // manually assigned grouping (see POST /devices/:id/outdoor-unit):
+//   outdoorUnit
 // }
 
 const registry = new Map();
@@ -41,6 +43,12 @@ function blankEntry(id) {
     // Most recent command initiated against this unit: { source, at } (or null).
     // Surfaced to the UI's info pane; the full history lives in the command log.
     lastCommand: null,
+    // Free-text id of the shared outdoor/condenser unit this indoor head is
+    // wired to, or null if unknown/unset. Multiple indoor heads on one
+    // outdoor unit must agree on heat vs. cool — see conflict.js. Not learned
+    // automatically (nothing in discovery/register reports it); assigned via
+    // POST /devices/:id/outdoor-unit.
+    outdoorUnit: null,
   };
 }
 
@@ -166,6 +174,7 @@ export function toDevice(entry, now = Date.now()) {
     desiredConfig: entry.desiredConfig,
     reportedConfig: entry.reportedConfig,
     lastCommand: entry.lastCommand,
+    outdoorUnit: entry.outdoorUnit,
   };
 }
 

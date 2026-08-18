@@ -1,6 +1,7 @@
 import { allSchedules, getSchedule } from './scheduleStore.js';
 import { getEntry } from './store.js';
 import { applyDeviceConfig } from './control.js';
+import { resolveStepConflicts } from './conflict.js';
 import { log } from './logger.js';
 
 // Schedule execution engine.
@@ -81,6 +82,10 @@ async function fireStep(scheduleId, stepId) {
       const res = await applyDeviceConfig(entry, step.config, 'scheduled', { scheduleId, stepId });
       log.info('schedule_device_ok', { scheduleId, stepId, deviceId, configId: res.configId });
       results.push({ deviceId, ok: true, configId: res.configId ?? null });
+      // Schedules are the source of truth: if this push shares an outdoor unit
+      // with a sibling running the opposite heat/cool direction, turn the
+      // sibling off so the scheduled command actually takes effect.
+      await resolveStepConflicts(schedule, step, deviceId, entry);
     } catch (err) {
       // Per-device isolation: one offline/unreachable unit must not abort the rest.
       log.warn('schedule_device_failed', { scheduleId, stepId, deviceId, code: err.code ?? null, error: err.message });

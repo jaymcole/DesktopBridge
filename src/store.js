@@ -44,10 +44,12 @@ function blankEntry(id) {
     // Surfaced to the UI's info pane; the full history lives in the command log.
     lastCommand: null,
     // Free-text id of the shared outdoor/condenser unit this indoor head is
-    // wired to, or null if unknown/unset. Multiple indoor heads on one
-    // outdoor unit must agree on heat vs. cool — see conflict.js. Not learned
-    // automatically (nothing in discovery/register reports it); assigned via
-    // POST /devices/:id/outdoor-unit.
+    // wired to, or null if unassigned. Multiple indoor heads on one outdoor
+    // unit must agree on heat vs. cool — see conflict.js, which treats every
+    // device with a null outdoorUnit as one shared implicit default group
+    // (not "no group") so conflict checking works before anything is tagged.
+    // Not learned automatically (nothing in discovery/register reports it);
+    // assigned via POST /devices/:id/outdoor-unit.
     outdoorUnit: null,
   };
 }

@@ -159,9 +159,15 @@ sharing the same outdoor unit is already running `heat`.
 
 - **Grouping.** A device can be assigned to an `outdoorUnit` group (a free-text
   id) via `POST /devices/:id/outdoor-unit`. This isn't learned automatically —
-  the bridge has no way to discover the physical wiring — so it must be set
-  once per device. Devices with no `outdoorUnit` set are never checked for
-  conflicts.
+  the bridge has no way to discover the physical wiring, and nothing reports
+  it — so it must be set manually, once per device.
+- **Default group.** Devices with no `outdoorUnit` assigned are **not** exempt
+  from conflict checking — they're all treated as one shared implicit group,
+  matching a single-physical-outdoor-unit install out of the box with zero
+  setup. A device is only carved out of that default group once it's given
+  its own explicit `outdoorUnit` value, so a second outdoor unit can be
+  introduced later by tagging just the devices on it — everything left
+  untagged stays together in the original default group.
 - **Resolution: schedules win.** When a scheduled step pushes `heat` (or
   `cool`/`dry`, which shares the compressor's cooling side) to a device, the
   bridge checks every other device in the same `outdoorUnit` group. If a

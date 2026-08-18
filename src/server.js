@@ -201,6 +201,10 @@ export function buildApp() {
   // devices this way lets the scheduler detect and resolve heat/cool
   // conflicts between them (see conflict.js). Not learned automatically —
   // assigned manually since the bridge has no way to discover the wiring.
+  // Devices with no outdoorUnit assigned are NOT exempt from conflict
+  // checking: conflict.js treats them as one shared implicit group, matching
+  // a single-outdoor-unit install out of the box. Only assign this once a
+  // second physical outdoor unit needs to be told apart from the rest.
   app.post('/devices/:id/outdoor-unit', (req, res) => {
     const entry = requireDevice(req);
     const { outdoorUnit } = req.body || {};

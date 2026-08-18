@@ -13,6 +13,26 @@ import { log } from './logger.js';
 // mode to a device, every other device sharing its `outdoorUnit` group that
 // is currently running the opposite direction gets turned off, so the
 // scheduled command actually takes effect.
+//
+// `outdoorUnit` is physical wiring the bridge has no way to discover on its
+// own (see POST /devices/:id/outdoor-unit) — nothing reports it. Rather than
+// silently skipping conflict checks until every device is manually tagged
+// (which would look like the feature does nothing on a fresh install), any
+// device with no `outdoorUnit` set falls into one shared implicit default
+// group together. That matches the common case of a single physical outdoor
+// unit out of the box. A device gets carved out of the default group only
+// once it's given its own explicit `outdoorUnit` value — so a second outdoor
+// unit can be introduced later by tagging just the devices on it, without
+// having to also tag everything already on the first one.
+
+// Sentinel for "no explicit outdoorUnit assigned". The endpoint validator
+// rejects an empty string as a real assignment, so this can never collide
+// with a user-provided value.
+const DEFAULT_GROUP = '';
+
+function groupOf(entry) {
+  return entry.outdoorUnit ?? DEFAULT_GROUP;
+}
 
 // 'dry' runs the compressor on the cooling side (it dehumidifies via the
 // cooling coil), so it's grouped with 'cool' here. 'auto' has no fixed side —
@@ -41,7 +61,8 @@ function currentSide(entry) {
 
 /**
  * After a schedule step successfully pushes `step.config` to `deviceId`,
- * find any other device sharing its `outdoorUnit` group that is currently
+ * find any other device in its outdoor-unit group (explicit, or the shared
+ * implicit default group when unset — see module comment) that is currently
  * running the opposite thermal direction, and turn it off. Devices also
  * targeted by this same step are never treated as conflicting with each
  * other — a step is allowed to set several of its own devices at once.
@@ -51,14 +72,14 @@ function currentSide(entry) {
  * scheduler.js's per-device pushes).
  */
 export async function resolveStepConflicts(schedule, step, deviceId, entry) {
-  if (!entry.outdoorUnit) return;
   const side = thermalSide(step.config);
   if (!side) return;
 
+  const group = groupOf(entry);
   const siblings = allEntries().filter(
     (other) =>
       other.id !== deviceId &&
-      other.outdoorUnit === entry.outdoorUnit &&
+      groupOf(other) === group &&
       !schedule.deviceIds.includes(other.id)
   );
 

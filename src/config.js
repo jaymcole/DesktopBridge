@@ -53,8 +53,19 @@ export const config = {
   // Append-only audit log of every command pushed to a unit (JSON-lines), for
   // later review. Not exposed via the API yet; the per-device "last command" is.
   commandLogFile: path.join(__dirname, '..', 'data', 'commands.jsonl'),
-  // Timeout for any HTTP call the bridge makes to a unit.
+  // Timeout for the bridge's read-only polls of a unit (GET /health, GET
+  // /config). Kept short so a stalled poll fails fast instead of blocking a
+  // reconcile tick; on a healthy LAN a unit answers these in well under 200ms.
   deviceTimeoutMs: int('DEVICE_TIMEOUT_MS', 5_000),
+  // Timeout for calls that make a unit DO something, which are legitimately slow
+  // and must not inherit the poll budget. POST /config and POST /resend transmit
+  // an IR burst and then verify it by reading their own emission back, which can
+  // reach ~2.4s when a command needs its full retry allowance; POST /identify
+  // blinks the status LED for ~3s before it answers. Cutting one of these off
+  // mid-transmission is worse than waiting: the unit still applies the command,
+  // but the bridge records the push as failed and leaves desiredConfigId stale,
+  // so the UI shows drift on a command that actually worked.
+  deviceCommandTimeoutMs: int('DEVICE_COMMAND_TIMEOUT_MS', 8_000),
   version: '1.0.0',
   service: 'ac-bridge',
 };

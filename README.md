@@ -55,7 +55,8 @@ on startup beyond the normal loop.
 | `POLL_INTERVAL_MS` | `60000`                  | How often the reconciliation loop polls each unit's `GET /health`.  |
 | `STALE_AFTER_MS`   | `900000` (15 min)        | A unit not seen for this long is marked `stale`. Must exceed `POLL_INTERVAL_MS`. |
 | `UI_ORIGIN`        | `http://localhost:5173`  | Allowed CORS origin for the React UI (`*` allows any).              |
-| `DEVICE_TIMEOUT_MS`| `5000`                   | Timeout for any HTTP call the bridge makes to a unit.               |
+| `DEVICE_TIMEOUT_MS`| `5000`                   | Timeout for read-only polls of a unit (`GET /health`, `GET /config`). |
+| `DEVICE_COMMAND_TIMEOUT_MS`| `8000`           | Timeout for calls that make a unit act (`POST /config`, `/resend`, `/identify`). These transmit IR and verify it, or blink the LED, so they are far slower than a poll. |
 
 ## Discovery
 

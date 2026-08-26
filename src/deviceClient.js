@@ -14,10 +14,12 @@ function baseUrl(entry) {
   return `http://${entry.ip}:${port}`;
 }
 
-async function call(entry, method, pathname, { body, auth = true } = {}) {
+// `timeoutMs` defaults to the short poll budget; calls that make the unit act
+// (transmit IR, blink the LED) pass the longer command budget explicitly.
+async function call(entry, method, pathname, { body, auth = true, timeoutMs = config.deviceTimeoutMs } = {}) {
   const url = baseUrl(entry) + pathname;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), config.deviceTimeoutMs);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   let res;
   try {
@@ -36,7 +38,9 @@ async function call(entry, method, pathname, { body, auth = true } = {}) {
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
   } catch (err) {
-    const reason = err.name === 'AbortError' ? 'timeout' : err.message;
+    // Name the budget that was exceeded — a timeout on a command call means
+    // something quite different from one on a poll, and the logs should say so.
+    const reason = err.name === 'AbortError' ? `timeout after ${timeoutMs}ms` : err.message;
     throw new ApiError('device_unreachable', `unit ${entry.id} unreachable: ${reason}`);
   } finally {
     clearTimeout(timer);
@@ -74,10 +78,13 @@ export const deviceClient = {
   health: (entry) => call(entry, 'GET', '/health', { auth: false }),
   // GET /config (auth) → { ok, configId, applied, config }
   getConfig: (entry) => call(entry, 'GET', '/config'),
-  // POST /config (auth) → { ok, configId }
-  postConfig: (entry, cfg) => call(entry, 'POST', '/config', { body: cfg }),
-  // POST /identify (auth) → { ok }
-  identify: (entry) => call(entry, 'POST', '/identify', { body: {} }),
-  // POST /resend (auth) → { ok, configId }
-  resend: (entry) => call(entry, 'POST', '/resend', { body: {} }),
+  // POST /config (auth) → { ok, configId, verified, attempts } — transmits IR.
+  postConfig: (entry, cfg) =>
+    call(entry, 'POST', '/config', { body: cfg, timeoutMs: config.deviceCommandTimeoutMs }),
+  // POST /identify (auth) → { ok } — blinks the unit's LED for ~3s before answering.
+  identify: (entry) =>
+    call(entry, 'POST', '/identify', { body: {}, timeoutMs: config.deviceCommandTimeoutMs }),
+  // POST /resend (auth) → { ok, configId, verified, attempts } — transmits IR.
+  resend: (entry) =>
+    call(entry, 'POST', '/resend', { body: {}, timeoutMs: config.deviceCommandTimeoutMs }),
 };

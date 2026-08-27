@@ -1,6 +1,6 @@
 import { config } from './config.js';
 import {
-  allEntries, touch, upsert, persist, removeEntry, pruneDuplicateIps,
+  allEntries, touch, upsert, persist, releaseIp, resolveDuplicateIps,
 } from './store.js';
 import { deviceClient } from './deviceClient.js';
 import { log } from './logger.js';
@@ -20,18 +20,33 @@ let timer = null;
 // the stall into a multi-second blackout. If a tick is still running, skip.
 let ticking = false;
 
-async function pollOne(entry) {
+/** Poll one entry. Exported for tests; the loop below drives it normally. */
+export async function pollOne(entry) {
   const id = entry.id;
+  // No ip means there is nowhere to poll: either the unit has only ever been
+  // seen via a register that carried no ip, or its ip was released after an
+  // identity collision. Either way it stays put, ages out to offline, and comes
+  // back the moment it registers or is rediscovered over mDNS.
+  if (!entry.ip) {
+    log.debug('poll_skipped_no_ip', { id, orphaned: entry.orphaned?.reason ?? null });
+    return;
+  }
   try {
     const health = await deviceClient.health(entry);
-    // The unit reports its own id in /health. If it no longer matches this
-    // entry's id, the unit at this ip was renamed/reflashed and this entry is
-    // the orphaned leftover of its old id — drop it instead of refreshing
-    // lastSeen, which would otherwise keep a duplicate alive forever (the
-    // still-reachable unit answering health checks under its new identity).
+    // The unit reports its own id in /health. If it doesn't match the entry we
+    // are polling, this entry's ip is stale — the unit living there answers to
+    // someone else. Release the ip (keeping the entry and everything configured
+    // on it) rather than refreshing lastSeen, which would otherwise let a
+    // still-reachable unit keep a second entry alive forever under an id it no
+    // longer uses.
+    //
+    // Note what this does NOT prove: that the device named `id` is gone. It may
+    // have moved, or another unit may have taken its id (a unit flashed before
+    // its id was updated). Deleting here would destroy a live device's config
+    // and schedule membership on that guess — see store.js releaseIp.
     if (health.id && health.id !== id) {
       log.info('device_id_changed', { staleId: id, currentId: health.id, ip: entry.ip });
-      removeEntry(id);
+      releaseIp(id, 'ip_answers_to_other_id');
       persist();
       return;
     }
@@ -109,11 +124,12 @@ async function tick() {
   }
   ticking = true;
   try {
-    // Belt-and-suspenders: catch any same-ip duplicates the per-poll id check
+    // Belt-and-suspenders: catch any same-ip collisions the per-poll id check
     // in pollOne wouldn't (e.g. a stale entry whose unit never answers, so it
     // never gets the chance to report a changed id) before polling this tick.
-    const pruned = pruneDuplicateIps();
-    if (pruned.length > 0) persist();
+    // Non-destructive — it only releases the losing entries' ip.
+    const released = resolveDuplicateIps();
+    if (released.length > 0) persist();
     const entries = allEntries();
     await Promise.allSettled(entries.map(pollOne));
   } finally {

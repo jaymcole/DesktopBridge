@@ -55,6 +55,7 @@ on startup beyond the normal loop.
 | `POLL_INTERVAL_MS` | `60000`                  | How often the reconciliation loop polls each unit's `GET /health`.  |
 | `STALE_AFTER_MS`   | `900000` (15 min)        | A unit not seen for this long is marked `stale`. Must exceed `POLL_INTERVAL_MS`. |
 | `UI_ORIGIN`        | `http://localhost:5173`  | Allowed CORS origin for the React UI (`*` allows any).              |
+| `DATA_DIR`         | `./data`                 | Directory for the persisted registry, schedules and command log.    |
 | `DEVICE_TIMEOUT_MS`| `5000`                   | Timeout for read-only polls of a unit (`GET /health`, `GET /config`). |
 | `DEVICE_COMMAND_TIMEOUT_MS`| `8000`           | Timeout for calls that make a unit act (`POST /config`, `/resend`, `/identify`). These transmit IR and verify it, or blink the LED, so they are far slower than a poll. |
 
@@ -71,26 +72,53 @@ not seen for `OFFLINE_AFTER_MS`, or that fires an mDNS `down` event, is marked
 so known-but-offline units stay visible — but see "Duplicate entries" below for
 the one case where an entry *is* removed automatically.
 
-### Duplicate entries (renamed/reflashed units)
+### Shared ips: duplicates vs. id collisions
 
-Renaming a unit (giving it a new `id`, e.g. to match its real-world location)
-leaves its old id behind in the registry as a separate entry — same ip, same
-everything, since it's the same physical unit. Left alone this looks like a
-permanent duplicate, because the reconciliation loop polls every known entry's
-`GET /health` by ip: the still-reachable unit answers for **both** the old and
-new id's poll, refreshing `lastSeen` on the stale entry forever instead of
-letting it age out to offline.
+Two entries can end up pointing at one ip, and they mean two very different
+things:
 
-The bridge closes this automatically: a unit's `/health` response includes its
-own id, and if it doesn't match the entry being polled, that entry is the
-orphaned old id and is removed on the spot (`reconcile.js`). As a
-belt-and-suspenders fallback (e.g. a stale entry that never answers a poll to
-report the mismatch), each reconciliation tick also prunes any entries that
-still share an ip, keeping whichever was seen most recently. Existing
-duplicates clean themselves up within one `POLL_INTERVAL_MS` of upgrading.
+1. **A rename/reflash to a new id.** Giving a unit a new `id` leaves its old id
+   behind as a separate entry — same ip, same everything, since it's the same
+   physical unit. Left alone it looks permanent, because the reconciliation loop
+   polls every entry's `GET /health` by ip: the still-reachable unit answers for
+   **both** ids, refreshing `lastSeen` on the stale entry forever instead of
+   letting it age out.
+2. **An id collision between two distinct units.** A unit flashed with firmware
+   whose `id` wasn't updated first boots claiming an id another device already
+   owns. Here both ids are real devices, and the "loser" is a live unit that is
+   about to check back in.
 
-For manual cleanup (or to force it immediately) use `POST /devices/dedupe` or
-`DELETE /devices/:id` — see the API reference below.
+**From the ip alone these are indistinguishable**, so the bridge does not guess
+destructively. Two mechanisms cover it:
+
+- **Identity guard (`store.js`, `identityConflict`).** A `POST /register` or an
+  mDNS advertisement that would move a *known* id onto a *different* ip while
+  the incumbent is still **online** is case 2, and is refused —
+  `409 id_conflict` on `/register`, ignored with a `mdns_id_conflict` warning on
+  mDNS. The real owner keeps its id, and the misflashed unit doesn't silently
+  inherit the other room's schedules. Because this only triggers while the
+  incumbent is online, an ordinary DHCP ip change is unaffected: a unit that
+  really moved stops answering at its old ip, ages out within
+  `OFFLINE_AFTER_MS`, and its next register is accepted.
+- **Non-destructive resolution (`resolveDuplicateIps`).** When entries do share
+  an ip, the most recently seen keeps it and the others have only their **ip**
+  released — the entry itself, its `desiredConfig`, its `outdoorUnit` grouping
+  and its place in every schedule are kept, and it's flagged `orphaned`. It
+  stops being polled at an address that isn't it and reads `offline` until the
+  real unit checks in, at which point it's reclaimed intact. The same applies
+  when a poll finds an ip answering to a different id (`reconcile.js`).
+
+That makes case 2 fully self-healing: reflash the unit with its own id and it
+comes back as itself, with nothing lost. Case 1 leaves a visible, offline,
+ip-less entry — remove it deliberately with `DELETE /devices/:id` or
+`POST /devices/dedupe`.
+
+> **Why not just delete?** Deleting on a guess is irreversible: it takes the
+> device's configuration with it and strips its id from every schedule, which
+> re-registering cannot restore. Releasing an ip costs nothing and is the
+> correct action in both cases, so hard deletion is reserved for the two
+> explicit endpoints, where the user is confirming the entry really is an
+> orphan.
 
 ## Reconciliation
 
@@ -138,13 +166,16 @@ of day. Schedules are created/edited by the React UI and executed by the bridge.
   rejected). Referencing a currently-unknown device does **not** fail the save —
   devices can be offline now and rediscovered later; the schedule just skips them
   per fire and logs a warning.
-- **Device removal prunes schedules.** When a device's registry entry is
-  deleted for good — via `DELETE /devices/:id`, dedup (`POST /devices/dedupe`
-  or the automatic same-ip prune), or a rename/reflash reconciled away — its id
-  is removed from every schedule's `deviceIds`. This is different from the
-  unknown/offline case above: an entry that's merely offline is left alone
-  since it may come back; an entry that's gone from the registry never will,
-  so schedules stop referencing it rather than failing on it forever.
+- **Only an explicit device removal prunes schedules.** `DELETE /devices/:id`
+  and `POST /devices/dedupe` remove the device's id from every schedule's
+  `deviceIds`, so schedules stop referencing an entry the user deliberately
+  deleted rather than failing on it forever. **Automatic cleanup never does
+  this.** Pruning is irreversible — re-registering under the same id cannot
+  restore schedule membership — so it is never done on an inference. A device
+  whose entry was cleaned up automatically (see
+  [Shared ips](#shared-ips-duplicates-vs-id-collisions)) keeps its place in
+  every schedule and resumes when it checks back in; while it's away, fires
+  skip it and log a warning, exactly like the unknown/offline case above.
 - **Observability.** Each fire logs `schedule_fire` plus a per-device
   `schedule_device_ok` / `schedule_device_failed`. `GET /health` includes a
   `schedules` array with each schedule's `nextRunAt` and `lastRun`.
@@ -224,17 +255,25 @@ Manually removes a device entry from the registry — e.g. a stale duplicate lef
 behind after a unit was renamed/reflashed with a new id. Idempotent — removing
 an unknown id is not an error.
 
+Being user-initiated, this **also prunes the id from every schedule** that
+references it. That is irreversible: re-registering under the same id will not
+restore schedule membership.
+
 ```json
 { "ok": true, "removed": true }
 ```
 
 ### `POST /devices/dedupe` — remove duplicate entries sharing an ip
 
-A unit is stationary at one ip, so two entries sharing an ip are always the
-same physical unit registered under more than one id, never two distinct
-units. This scans the registry and removes all but the most-recently-seen
-entry per shared ip. Usually unnecessary — see "Duplicate entries" below —
-but useful to force an immediate cleanup.
+Scans the registry and removes all but the most-recently-seen entry per shared
+ip, pruning the removed ids from schedules too. Usually unnecessary — see
+[Shared ips](#shared-ips-duplicates-vs-id-collisions) — but useful to clear
+orphans left by a rename.
+
+**Destructive and irreversible**, unlike the automatic path, which only releases
+the losing entries' ip. Entries sharing an ip are not always one unit under two
+ids — two distinct units collide the same way when one is flashed before its id
+is updated — so calling this is the user confirming they really are duplicates.
 
 ```json
 { "ok": true, "removed": ["ac-old-id"] }
@@ -346,6 +385,19 @@ An optional `port` is also accepted, letting a unit that only self-registers
 { "ok": true }
 ```
 
+Rejected with `409 id_conflict` when the `id` is already held by a **different,
+currently online** ip — two units claiming one id, which is what a unit flashed
+before its id was updated looks like. `details` names both sides:
+
+```json
+{ "ok": false, "error": { "code": "id_conflict",
+  "message": "device id \"ac-kitchen\" is already held by a unit at 192.168.1.51 that is currently online; the unit at 192.168.1.50 must be flashed with its own id",
+  "details": { "id": "ac-kitchen", "claimingIp": "192.168.1.50", "heldByIp": "192.168.1.51" } } }
+```
+
+An ordinary ip change is **not** a conflict — see
+[Shared ips](#shared-ips-duplicates-vs-id-collisions).
+
 ### `POST /observed` — unit-pushed observed state (**requires bearer token**)
 
 Called by a unit the instant it decodes a command from the AC's **physical
@@ -382,6 +434,7 @@ are ISO-8601 UTC; temperatures are °C.
   "desiredConfig": { "schema": 1, "power": "on", "mode": "cool", "temp": 21, "fan": "auto", "vaneVert": "auto", "vaneHoriz": "auto" },
   "reportedConfig": { "schema": 1, "power": "on", "mode": "cool", "temp": 21, "fan": "auto", "vaneVert": "auto", "vaneHoriz": "auto" },
   "lastCommand": { "source": "scheduled", "at": "2026-07-24T18:30:12Z" },
+  "orphaned": null,
   "outdoorUnit": "condenser-a"
 }
 ```
@@ -390,6 +443,7 @@ are ISO-8601 UTC; temperatures are °C.
 - `lastCommand`: the most recent command initiated against this unit (`source` + ISO `at`), or `null`. Reflects the last *initiated* command, success or not. Full history is in the [command log](#command-log).
 - `desiredConfig`: what the user wants (bridge intent, set by UI pushes). `reportedConfig`: the unit's actual last state (from polls **and** `/observed` remote captures).
 - `inSync`: `unitConfigId === desiredConfigId && applied === true`. The UI shows a "drift" badge when false.
+- `orphaned`: `{ at, reason }` when an ip-identity collision released this entry's ip, else `null`. The device is kept with all of its configuration but has no known address, so it reads `offline` until it checks back in — see [Shared ips](#shared-ips-duplicates-vs-id-collisions). `reason` is `ip_claimed_by_other_device` (another entry holds the ip) or `ip_answers_to_other_id` (a poll found a different unit there).
 - `outdoorUnit`: the shared outdoor/condenser unit group this device belongs to, or `null` if unset. Set via [`POST /devices/:id/outdoor-unit`](#post-devicesidoutdoor-unit--assignclear-the-shared-outdoor-unit-group). See [Outdoor-unit conflicts](#outdoor-unit-conflicts).
 
 ## Config schema v1
@@ -419,6 +473,7 @@ Every non-2xx bridge response:
 | `validation_error`   | 400  | Bad input to the bridge (unknown key, out-of-range value).    |
 | `unauthorized`       | 401  | Missing/invalid bearer token (on `/register`, `/observed`).   |
 | `device_not_found`   | 404  | Unknown device id / unknown route.                            |
+| `id_conflict`        | 409  | Two units claiming one device id (on `/register`).            |
 | `device_unreachable` | 502  | Proxied unit didn't answer (timeout / connection refused).    |
 | `device_error`       | 502  | Unit answered but rejected the request; its message in `details`. |
 | `internal_error`     | 500  | Unexpected bridge failure.                                    |

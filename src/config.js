@@ -29,6 +29,13 @@ function parseOrigins(raw) {
   return list.length ? list : ['http://localhost:5173'];
 }
 
+// Directory holding the persisted registry, schedules and command log.
+// Overridable so a second instance (or a test run) can keep its own state
+// instead of writing over the deployment's.
+const dataDir = process.env.DATA_DIR
+  ? path.resolve(process.env.DATA_DIR)
+  : path.join(__dirname, '..', 'data');
+
 const TOKEN = process.env.TOKEN;
 if (!TOKEN) {
   // Fail fast: without a token the bridge cannot auth to units or protect /register.
@@ -46,13 +53,13 @@ export const config = {
   offlineAfterMs: int('OFFLINE_AFTER_MS', 150_000),
   uiOrigin: parseOrigins(process.env.UI_ORIGIN),
   // Where the registry + desired configs are persisted.
-  dataFile: path.join(__dirname, '..', 'data', 'state.json'),
+  dataFile: path.join(dataDir, 'state.json'),
   // Where automated control schedules are persisted (separate from device state
   // so a schedule save never rewrites the volatile device registry).
-  schedulesFile: path.join(__dirname, '..', 'data', 'schedules.json'),
+  schedulesFile: path.join(dataDir, 'schedules.json'),
   // Append-only audit log of every command pushed to a unit (JSON-lines), for
   // later review. Not exposed via the API yet; the per-device "last command" is.
-  commandLogFile: path.join(__dirname, '..', 'data', 'commands.jsonl'),
+  commandLogFile: path.join(dataDir, 'commands.jsonl'),
   // Timeout for the bridge's read-only polls of a unit (GET /health, GET
   // /config). Kept short so a stalled poll fails fast instead of blocking a
   // reconcile tick; on a healthy LAN a unit answers these in well under 200ms.

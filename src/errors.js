@@ -9,6 +9,9 @@ export const CODES = {
   unauthorized: 401,
   device_not_found: 404,
   schedule_not_found: 404,
+  // Two physical units claiming one device id (see POST /register's identity
+  // guard). 409 because the request is well-formed — it conflicts with state.
+  id_conflict: 409,
   device_unreachable: 502,
   device_error: 502,
   internal_error: 500,

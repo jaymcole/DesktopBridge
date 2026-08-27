@@ -7,7 +7,7 @@ import { validateConfig } from './schema.js';
 import { validateSchedule } from './scheduleSchema.js';
 import {
   getEntry, allEntries, toDevice, computeStatus, touch, upsert, persist,
-  removeEntry, pruneDuplicateIps,
+  removeEntry, pruneDuplicateIps, identityConflict,
 } from './store.js';
 import {
   getSchedule, allSchedules, putSchedule, removeSchedule,
@@ -111,6 +111,29 @@ export function buildApp() {
     if (!id || typeof id !== 'string') {
       throw new ApiError('validation_error', 'register requires a string "id"', { field: 'id' });
     }
+
+    // Identity guard. A register that moves a KNOWN id to a different ip while
+    // the incumbent is still online means two physical units are claiming one
+    // id — almost always a unit flashed before its id was updated, so it boots
+    // holding an id another device already owns. Accepting it silently
+    // repoints the entry at the wrong hardware, which then receives the other
+    // room's scheduled commands, and leaves the real owner invisible until it
+    // next checks in. Refuse, and say exactly what collided.
+    //
+    // Scoped to an ONLINE incumbent so an ordinary ip change (new DHCP lease)
+    // is unaffected: a unit that actually moved stops answering at its old ip,
+    // ages out within OFFLINE_AFTER_MS, and its next register is accepted.
+    const heldByIp = identityConflict(id, ip);
+    if (heldByIp) {
+      log.warn('register_id_conflict', { id, claimingIp: ip, heldByIp });
+      throw new ApiError(
+        'id_conflict',
+        `device id "${id}" is already held by a unit at ${heldByIp} that is currently online; `
+        + `the unit at ${ip} must be flashed with its own id`,
+        { id, claimingIp: ip, heldByIp },
+      );
+    }
+
     touch(id, {
       location: location ?? undefined,
       ip: ip ?? undefined,
@@ -167,17 +190,25 @@ export function buildApp() {
 
   // ---- UI: remove a stale/duplicate device entry ---------------------------
   // Idempotent — removing an unknown id is not an error (nothing to remove).
+  // Being user-initiated, this also prunes the id from every schedule that
+  // references it. That is irreversible (re-registering under the same id will
+  // not restore schedule membership), which is why only the two explicit
+  // removal endpoints do it and automatic cleanup never does.
   app.delete('/devices/:id', (req, res) => {
-    const removed = removeEntry(req.params.id);
+    const removed = removeEntry(req.params.id, { pruneSchedules: true });
     if (removed) persist();
     log.info('device_removed', { id: req.params.id, removed });
     res.json({ ok: true, removed });
   });
 
   // ---- UI: remove duplicate entries sharing an ip --------------------------
-  // A unit is stationary at one ip, so entries sharing an ip are always the
-  // same physical unit left registered under more than one id (e.g. after a
-  // rename/reflash). Keeps whichever entry per ip was seen most recently.
+  // Keeps whichever entry per ip was seen most recently and deletes the rest,
+  // pruning them from schedules too. Explicit and irreversible — the automatic
+  // path (every reconcile tick, and every device contact) instead only releases
+  // the losing entries' ip, because entries sharing an ip are not always one
+  // unit under two ids: two distinct units collide the same way when one is
+  // flashed before its id is updated. This endpoint is the user confirming they
+  // really are leftover duplicates.
   app.post('/devices/dedupe', (req, res) => {
     const removed = pruneDuplicateIps();
     if (removed.length > 0) persist();

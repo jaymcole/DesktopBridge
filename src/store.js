@@ -18,7 +18,9 @@ import { removeDeviceFromSchedules } from './scheduleStore.js';
 //   // the bridge's intent:
 //   desiredConfig, desiredConfigId,
 //   // manually assigned grouping (see POST /devices/:id/outdoor-unit):
-//   outdoorUnit
+//   outdoorUnit,
+//   // set when an ip-identity collision released this entry's ip (see releaseIp):
+//   orphaned
 // }
 
 const registry = new Map();
@@ -43,6 +45,12 @@ function blankEntry(id) {
     // Most recent command initiated against this unit: { source, at } (or null).
     // Surfaced to the UI's info pane; the full history lives in the command log.
     lastCommand: null,
+    // Set when an ip-identity collision showed this entry's `ip` was pointing at
+    // hardware that is not this device (see releaseIp). The entry is KEPT with
+    // all of its configuration; only the ip is dropped, so it stops being polled
+    // at an address that isn't it and ages out to offline until the real unit
+    // checks back in. { at, reason } or null.
+    orphaned: null,
     // Free-text id of the shared outdoor/condenser unit this indoor head is
     // wired to, or null if unassigned. Multiple indoor heads on one outdoor
     // unit must agree on heat vs. cool — see conflict.js, which treats every
@@ -62,14 +70,21 @@ export function allEntries() {
   return [...registry.values()];
 }
 
-/** Hard-delete a device entry (e.g. a stale id left behind after a unit was
- * renamed/reflashed). Also drops the id from any schedule that still
- * references it, so a renamed/removed device can't leave schedules failing
- * on a ghost id forever. Returns whether it existed. Does not persist (the
- * schedule-store prune persists itself, on its own file). */
-export function removeEntry(id) {
+/**
+ * Hard-delete a device entry. Returns whether it existed. Does not persist (the
+ * schedule-store prune persists itself, on its own file).
+ *
+ * `pruneSchedules` additionally drops the id from every schedule referencing
+ * it. That is IRREVERSIBLE — re-registering under the same id cannot restore
+ * schedule membership — so it is opt-in and reserved for a user-initiated
+ * delete (DELETE /devices/:id, POST /devices/dedupe), where removing the device
+ * is a deliberate act. Automatic, inferred cleanup must never pass it: a wrong
+ * guess would silently rewrite the user's schedules. Automatic paths should
+ * generally prefer releaseIp() and not delete at all.
+ */
+export function removeEntry(id, { pruneSchedules = false } = {}) {
   const existed = registry.delete(id);
-  if (existed) {
+  if (existed && pruneSchedules) {
     const affected = removeDeviceFromSchedules(id);
     if (affected.length > 0) log.info('schedule_device_pruned', { deviceId: id, scheduleIds: affected });
   }
@@ -77,30 +92,114 @@ export function removeEntry(id) {
 }
 
 /**
- * Find entries that share an ip address with another entry and remove all but
- * the most recently seen one. Units are stationary with a fixed ip, so a
- * shared ip always means the same physical unit under more than one id (e.g.
- * left behind after a rename/reflash) — never two distinct units. Returns the
- * removed ids. Does not persist.
+ * Drop an entry's ip (and port) while keeping the entry and everything the user
+ * configured on it — desiredConfig, outdoorUnit, schedule membership.
+ *
+ * This is the safe response to any ip-identity collision. Discovering that the
+ * unit answering at an ip is not this device proves exactly one thing: this
+ * entry's `ip` is stale. It says nothing about whether the device still exists
+ * — it may simply have moved, or another unit may have briefly claimed its id
+ * (e.g. a unit flashed with firmware whose id was not updated first). Deleting
+ * on that evidence destroys a live device's configuration; releasing the ip
+ * costs nothing, because the entry ages out to offline on its own and is
+ * reclaimed intact the moment the real unit registers or is rediscovered.
  */
-export function pruneDuplicateIps() {
+export function releaseIp(id, reason) {
+  const entry = registry.get(id);
+  if (!entry || !entry.ip) return false;
+  log.warn('device_ip_released', { id, ip: entry.ip, reason });
+  entry.ip = null;
+  entry.orphaned = { at: new Date().toISOString(), reason };
+  // Drop liveness with the ip. Whatever refreshed lastSeen did so by answering
+  // at an ip we have just established is not this device, so keeping it would
+  // report a device as "online" that the bridge provably cannot reach. Cleared,
+  // it reads offline until the real unit makes contact and reclaims the entry.
+  entry.lastSeen = null;
+  entry.down = true;
+  return true;
+}
+
+/**
+ * Group entries by ip and return [{ ip, keep, stale[] }] for every ip claimed by
+ * more than one entry, `keep` being the most recently seen. Sorted newest-first
+ * with the id as a deterministic tiebreaker, so a restart (which nulls every
+ * lastSeen, tying them all) can't resolve the same collision two different ways
+ * on two different runs.
+ */
+function collisionsByIp() {
   const byIp = new Map();
   for (const entry of registry.values()) {
     if (!entry.ip) continue;
     if (!byIp.has(entry.ip)) byIp.set(entry.ip, []);
     byIp.get(entry.ip).push(entry);
   }
-  const removed = [];
-  for (const entries of byIp.values()) {
+  const out = [];
+  for (const [ip, entries] of byIp) {
     if (entries.length < 2) continue;
-    entries.sort((a, b) => new Date(b.lastSeen ?? 0) - new Date(a.lastSeen ?? 0));
+    entries.sort((a, b) => {
+      const delta = new Date(b.lastSeen ?? 0) - new Date(a.lastSeen ?? 0);
+      return delta !== 0 ? delta : a.id.localeCompare(b.id);
+    });
     const [keep, ...stale] = entries;
+    out.push({ ip, keep, stale });
+  }
+  return out;
+}
+
+/**
+ * Automatic, NON-destructive resolution of entries sharing an ip: the most
+ * recently seen entry keeps the ip, and every other entry has its ip released
+ * (releaseIp) while the entry itself — and everything configured on it — is
+ * kept. Returns the ids whose ip was released. Does not persist.
+ *
+ * Two entries at one ip mean one of two things, and the bridge cannot tell them
+ * apart from the ip alone:
+ *
+ *   1. A rename/reflash to a NEW id, leaving the old id behind as a genuine
+ *      orphan. Deleting it is correct.
+ *   2. An id COLLISION between two distinct units — e.g. a unit flashed with
+ *      firmware whose id was not updated first, so it boots claiming an id
+ *      another device already owns. Here BOTH ids are real devices, and the
+ *      loser is a live unit that is about to check back in.
+ *
+ * This used to assume (1) always and hard-delete the loser, which in case (2)
+ * destroyed a working device's desiredConfig and outdoor-unit grouping and
+ * stripped it from every schedule — damage that re-registering cannot undo,
+ * from nothing worse than one bad boot. Releasing the ip is the action that is
+ * correct in BOTH cases: the stale ip stops being polled either way, case (2)
+ * heals completely the moment the real unit registers, and case (1) leaves a
+ * visible, offline, ip-less entry the user can delete deliberately (DELETE
+ * /devices/:id or POST /devices/dedupe) once they can see it is an orphan.
+ */
+export function resolveDuplicateIps() {
+  const released = [];
+  for (const { ip, keep, stale } of collisionsByIp()) {
     for (const entry of stale) {
-      registry.delete(entry.id);
+      log.warn('device_ip_conflict', { id: entry.id, keptId: keep.id, ip });
+      releaseIp(entry.id, 'ip_claimed_by_other_device');
+      released.push(entry.id);
+    }
+  }
+  return released;
+}
+
+/**
+ * Destructive dedup: hard-delete every entry that shares an ip with a more
+ * recently seen one, pruning the deleted ids from schedules too. Returns the
+ * removed ids. Does not persist.
+ *
+ * User-initiated only (POST /devices/dedupe) — this is the "yes, these really
+ * are leftover duplicates, remove them" action. Automatic paths use
+ * resolveDuplicateIps() instead; see the note there on why guessing must not
+ * delete.
+ */
+export function pruneDuplicateIps() {
+  const removed = [];
+  for (const { ip, keep, stale } of collisionsByIp()) {
+    for (const entry of stale) {
+      removeEntry(entry.id, { pruneSchedules: true });
       removed.push(entry.id);
-      log.info('device_duplicate_removed', { removedId: entry.id, keptId: keep.id, ip: entry.ip });
-      const affected = removeDeviceFromSchedules(entry.id);
-      if (affected.length > 0) log.info('schedule_device_pruned', { deviceId: entry.id, scheduleIds: affected });
+      log.info('device_duplicate_removed', { removedId: entry.id, keptId: keep.id, ip });
     }
   }
   return removed;
@@ -125,14 +224,43 @@ export function upsert(id, fields = {}) {
 }
 
 /** Record any contact with a unit: updates lastSeen and clears the down flag.
- * Also immediately drops any other entry left sharing this ip — this entry's
- * live contact makes it the freshest, so a same-ip sibling is a stale
- * duplicate (an old id from before a rename/reflash) rather than a distinct
- * unit. Callers persist as usual; this doesn't add an extra write. */
+ * Contact at a known ip also re-resolves that ip: this entry's live contact
+ * makes it the freshest claimant, so any other entry still pointing at the same
+ * ip has a stale ip and gets it released (never deleted — see
+ * resolveDuplicateIps). Reaching a device again also clears its own `orphaned`
+ * marker, since it just proved where it lives. Callers persist as usual; this
+ * doesn't add an extra write. */
 export function touch(id, fields = {}) {
   const entry = upsert(id, { ...fields, lastSeen: new Date().toISOString(), down: false });
-  if (entry.ip) pruneDuplicateIps();
+  if (entry.ip) {
+    if (entry.orphaned) {
+      log.info('device_reclaimed', { id, ip: entry.ip, orphanedAt: entry.orphaned.at });
+      entry.orphaned = null;
+    }
+    resolveDuplicateIps();
+  }
   return entry;
+}
+
+/**
+ * Would letting `id` claim `ip` hijack a live device? Returns the incumbent's
+ * ip when it would, else null.
+ *
+ * True when the id is already held by an entry sitting at a DIFFERENT ip that
+ * is still online — i.e. two physical units claiming one id, which is what a
+ * unit flashed before its id was updated looks like. Shared by every inbound
+ * identity claim (POST /register and mDNS), so a unit cannot simply take the
+ * path that isn't guarded.
+ *
+ * Deliberately scoped to an ONLINE incumbent: a device that genuinely changed
+ * ip (new DHCP lease) goes quiet at the old one and ages out within
+ * OFFLINE_AFTER_MS, after which its claim is accepted normally.
+ */
+export function identityConflict(id, ip) {
+  if (!ip) return null;
+  const incumbent = registry.get(id);
+  if (!incumbent || !incumbent.ip || incumbent.ip === ip) return null;
+  return computeStatus(incumbent) === 'online' ? incumbent.ip : null;
 }
 
 export function computeStatus(entry, now = Date.now()) {
@@ -176,6 +304,7 @@ export function toDevice(entry, now = Date.now()) {
     desiredConfig: entry.desiredConfig,
     reportedConfig: entry.reportedConfig,
     lastCommand: entry.lastCommand,
+    orphaned: entry.orphaned,
     outdoorUnit: entry.outdoorUnit,
   };
 }

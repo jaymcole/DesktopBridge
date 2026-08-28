@@ -1,9 +1,9 @@
 import { Bonjour } from 'bonjour-service';
-import { touch, upsert, getEntry, persist, identityConflict } from './store.js';
+import { touch, upsert, getEntry, persist, identityConflict, normalizeMac } from './store.js';
 import { log } from './logger.js';
 
 // mDNS discovery for service type _acctrl._tcp. Each advertised service carries
-// TXT records id/loc/fw plus host/ip/port. We merge these into the registry
+// TXT records id/loc/fw/mac plus host/ip/port. We merge these into the registry
 // keyed by device id and handle up/down events.
 
 let bonjour = null;
@@ -29,15 +29,17 @@ function onUp(service) {
   // move. Ignore the advertisement rather than repointing the entry at the
   // wrong hardware — guarding only /register would leave mDNS as a way around
   // it, since a misflashed unit advertises under the borrowed id too.
-  const heldByIp = identityConflict(id, ip);
-  if (heldByIp) {
-    log.warn('mdns_id_conflict', { id, claimingIp: ip, heldByIp });
+  const mac = normalizeMac(txt.mac);
+  const conflict = identityConflict(id, ip, mac);
+  if (conflict) {
+    log.warn('mdns_id_conflict', { id, claimingIp: ip, claimingMac: mac, ...conflict });
     return;
   }
   touch(id, {
     location: txt.loc ?? undefined,
     firmware: txt.fw ?? undefined,
     ip: ip ?? undefined,
+    mac: mac ?? undefined,
     port: service.port ?? undefined,
   });
   log.info('mdns_up', { id, ip, port: service.port, location: txt.loc });

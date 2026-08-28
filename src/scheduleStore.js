@@ -57,6 +57,28 @@ export function removeDeviceFromSchedules(deviceId) {
   return affected;
 }
 
+/**
+ * Replace every reference to `oldId` with `newId` across all schedules, in
+ * place and preserving order. Used when a device is rekeyed (see store.js
+ * rekeyEntry) — a device that changes id must keep its place in the schedules
+ * that drive it, or the rekey silently stops it being controlled. Collapses to
+ * a single reference if a schedule somehow named both. Returns the ids of the
+ * schedules that were changed.
+ */
+export function renameDeviceInSchedules(oldId, newId) {
+  const affected = [];
+  for (const schedule of schedules.values()) {
+    if (!schedule.deviceIds.includes(oldId)) continue;
+    const seen = new Set();
+    schedule.deviceIds = schedule.deviceIds
+      .map((d) => (d === oldId ? newId : d))
+      .filter((d) => !seen.has(d) && seen.add(d));
+    affected.push(schedule.id);
+  }
+  if (affected.length > 0) persist();
+  return affected;
+}
+
 // ---- persistence -----------------------------------------------------------
 
 let persistTimer = null;

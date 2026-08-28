@@ -63,7 +63,7 @@ on startup beyond the normal loop.
 
 The registry is populated from two sources, keyed by device `id`:
 
-1. **mDNS** — browses `_acctrl._tcp`. TXT records `id`, `loc`, `fw` plus host/ip/port. Handles `up`/`down`.
+1. **mDNS** — browses `_acctrl._tcp`. TXT records `id`, `mac`, `loc`, `fw` plus host/ip/port. Handles `up`/`down`. The advertised hostname is `ac-<location>.local`, which stays human-readable even though the id is chip-derived.
 2. **Self-registration** — units `POST /register` on boot and every ~5 min.
 
 `lastSeen` updates on any contact (mDNS, register, or a successful poll). A unit
@@ -72,7 +72,29 @@ not seen for `OFFLINE_AFTER_MS`, or that fires an mDNS `down` event, is marked
 so known-but-offline units stay visible — but see "Duplicate entries" below for
 the one case where an entry *is* removed automatically.
 
+### Device identity
+
+A device's `id` is what schedules, desired configs and outdoor-unit groupings
+all hang off, so the bridge has to be able to answer "is this the same unit?"
+correctly. Three things can identify a unit, and they are **not** equally
+trustworthy:
+
+| Signal | Trust | Why |
+| ------ | ----- | --- |
+| `mac`  | Authoritative | Factory-burned into the chip. Survives reflashing and cannot be typed in wrong. |
+| `id`   | Claimed       | Derived from the MAC on current firmware, but it's just a string in the request — older firmware had it hardcoded, which is how one unit came to claim another's. |
+| `ip`   | Circumstantial| Stable in practice, but DHCP moves happen and two units *can* transiently share one. |
+
+Where both sides report a `mac`, identity is decided by it alone: the same chip
+at a new ip is simply a move, and a different chip claiming a held id is refused
+outright (`409 id_conflict`). Only when a MAC is unavailable does the bridge fall
+back to the weaker ip reasoning below.
+
 ### Shared ips: duplicates vs. id collisions
+
+> Mostly historical once every unit reports a `mac` — the MAC check above
+> settles these cases directly. This is the fallback for firmware that predates
+> MAC reporting.
 
 Two entries can end up pointing at one ip, and they mean two very different
 things:
@@ -119,6 +141,46 @@ ip-less entry — remove it deliberately with `DELETE /devices/:id` or
 > correct action in both cases, so hard deletion is reserved for the two
 > explicit endpoints, where the user is confirming the entry really is an
 > orphan.
+
+### Migrating to chip-derived ids
+
+Firmware ≥ 1.3.0 derives its `id` from the chip's eFuse MAC
+(`ac-<12 hex digits>`) instead of a hardcoded string, so a unit's identity can
+no longer be got wrong by flashing — the id follows the board, not the sketch.
+`location` stays hardcoded: it's the human label the chip can't know, and with
+the id now opaque it's what names the unit in the UI. Keep it meaningful and
+unique per device.
+
+The id change would otherwise look like "old device vanished, new device
+appeared", stranding each unit's config and its place in every schedule. The
+bridge migrates instead, on the unit's first register, using whichever signal is
+available:
+
+1. **Matching `mac`** — an existing entry already known to be this chip, under a
+   different id. Needs nothing from the firmware but the MAC.
+2. **`legacyId`** — the id this firmware used to report. Covers the first
+   switchover, where the old entry predates MAC reporting entirely.
+
+Either way the existing entry is *rekeyed*: same device, new id, configuration
+and schedule membership intact. The bridge logs `register_migrated` and the
+register response carries `migratedFrom`. An entry is never adopted by a unit
+whose MAC is known to differ.
+
+**To upgrade a unit:**
+
+1. In `ac_controller.ino`, set `kLegacyDeviceId` to the id **this specific
+   unit** currently reports (e.g. `"ac-basement"`), and check `kLocation` is
+   right. Do not set `kDeviceId` — it no longer exists as a constant.
+2. Flash, and watch the serial log for the `[boot] device id:` line.
+3. Confirm the bridge logs `register_migrated` with the expected `oldId`, and
+   that `GET /schedules` still lists the device (under its new id).
+4. Once every unit is migrated, `kLegacyDeviceId` can be set to `nullptr`. It's
+   inert after the first successful migration, so this is optional tidying.
+
+If a unit was already flashed without `kLegacyDeviceId` set correctly and came
+up as a new device, fix it with
+[`POST /devices/:id/rekey`](#post-devicesidrekey--move-a-device-to-a-new-id) —
+rekey the **old** entry onto the new id — rather than deleting anything.
 
 ## Reconciliation
 
@@ -279,6 +341,27 @@ is updated — so calling this is the user confirming they really are duplicates
 { "ok": true, "removed": ["ac-old-id"] }
 ```
 
+### `POST /devices/:id/rekey` — move a device to a new id
+
+Body: `{ "newId": "ac-84fce6123456" }`. Moves the device's entry **and every
+schedule reference to it** onto the new id, keeping `desiredConfig`,
+`outdoorUnit` and `lastCommand`. If `newId` already exists it is treated as the
+same unit having registered early: the old entry's user configuration is kept
+and the newer entry's live facts (ip, MAC, liveness) win.
+
+```json
+{ "ok": true, "device": { "id": "ac-84fce6123456", "...": "..." }, "scheduleIds": ["sched-1"] }
+```
+
+Refused with `409 id_conflict` if `newId` already belongs to a **different
+chip**. This is the manual counterpart to the automatic migration in
+`POST /register` — use it when the automatic signals aren't available, e.g. a
+unit was reflashed to a chip-derived id before the bridge ever learned its MAC.
+
+Deleting the old device and re-adding the new one is **not** equivalent: a
+delete prunes the id from every schedule, and re-registering cannot restore
+that. Rekeying is the only operation that carries schedule membership across.
+
 ### `POST /devices/:id/config` — set desired config
 
 Body is a schema-v1 config object. The bridge validates it (rejecting unknown
@@ -377,9 +460,19 @@ an error.
 
 ### `POST /register` — unit self-registration (**requires bearer token**)
 
-Called by units, not the UI. Body: `{ id, location, ip, firmware, schema, configId }`.
+Called by units, not the UI. Body: `{ id, mac, location, ip, firmware, schema, configId }`.
 An optional `port` is also accepted, letting a unit that only self-registers
 (no mDNS) advertise a non-80 HTTP port; if omitted the bridge assumes port 80.
+
+`mac` is the unit's factory-burned chip MAC (any spelling — `84:FC:E6:12:34:56`,
+`84-fc-e6-12-34-56`, or bare hex — normalized to lowercase hex internally). It is
+optional for older firmware, but where present it is **authoritative**: see
+[Device identity](#device-identity).
+
+An optional `legacyId` names the id this unit reported before moving to a
+chip-derived id, and triggers a one-time migration — see
+[Migrating to chip-derived ids](#migrating-to-chip-derived-ids). The response
+echoes `migratedFrom` (the old id, or `null`).
 
 ```json
 { "ok": true }
@@ -433,6 +526,7 @@ are ISO-8601 UTC; temperatures are °C.
   "applied": true,
   "desiredConfig": { "schema": 1, "power": "on", "mode": "cool", "temp": 21, "fan": "auto", "vaneVert": "auto", "vaneHoriz": "auto" },
   "reportedConfig": { "schema": 1, "power": "on", "mode": "cool", "temp": 21, "fan": "auto", "vaneVert": "auto", "vaneHoriz": "auto" },
+  "mac": "84fce6123456",
   "lastCommand": { "source": "scheduled", "at": "2026-07-24T18:30:12Z" },
   "orphaned": null,
   "outdoorUnit": "condenser-a"
@@ -443,6 +537,7 @@ are ISO-8601 UTC; temperatures are °C.
 - `lastCommand`: the most recent command initiated against this unit (`source` + ISO `at`), or `null`. Reflects the last *initiated* command, success or not. Full history is in the [command log](#command-log).
 - `desiredConfig`: what the user wants (bridge intent, set by UI pushes). `reportedConfig`: the unit's actual last state (from polls **and** `/observed` remote captures).
 - `inSync`: `unitConfigId === desiredConfigId && applied === true`. The UI shows a "drift" badge when false.
+- `mac`: the unit's chip MAC (lowercase hex, no separators), or `null` for firmware that doesn't report one. Authoritative identity — see [Device identity](#device-identity).
 - `orphaned`: `{ at, reason }` when an ip-identity collision released this entry's ip, else `null`. The device is kept with all of its configuration but has no known address, so it reads `offline` until it checks back in — see [Shared ips](#shared-ips-duplicates-vs-id-collisions). `reason` is `ip_claimed_by_other_device` (another entry holds the ip) or `ip_answers_to_other_id` (a poll found a different unit there).
 - `outdoorUnit`: the shared outdoor/condenser unit group this device belongs to, or `null` if unset. Set via [`POST /devices/:id/outdoor-unit`](#post-devicesidoutdoor-unit--assignclear-the-shared-outdoor-unit-group). See [Outdoor-unit conflicts](#outdoor-unit-conflicts).
 

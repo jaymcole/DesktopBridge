@@ -7,7 +7,8 @@ import { validateConfig } from './schema.js';
 import { validateSchedule } from './scheduleSchema.js';
 import {
   getEntry, allEntries, toDevice, computeStatus, touch, upsert, persist,
-  removeEntry, pruneDuplicateIps, identityConflict,
+  removeEntry, pruneDuplicateIps, identityConflict, normalizeMac, entryByMac,
+  rekeyEntry,
 } from './store.js';
 import {
   getSchedule, allSchedules, putSchedule, removeSchedule,
@@ -75,6 +76,7 @@ export function buildApp() {
         'POST /devices/dedupe': 'remove duplicate entries sharing an ip, keeping the most recently seen',
         'POST /devices/:id/config': 'set desired config (validated, proxied to unit)',
         'POST /devices/:id/outdoor-unit': 'assign/clear the shared outdoor-unit group used for schedule conflict resolution',
+        'POST /devices/:id/rekey': 'move a device (and its schedule membership) to a new id',
         'POST /devices/:id/identify': "blink the unit's LED",
         'POST /devices/:id/resend': "re-transmit the unit's last config",
         'GET /schedules': 'all automated control schedules',
@@ -107,30 +109,56 @@ export function buildApp() {
 
   // ---- unit self-registration (units authenticate with the shared token) ---
   app.post('/register', requireToken, wrap(async (req, res) => {
-    const { id, location, ip, firmware, schema, configId, port } = req.body || {};
+    const { id, location, ip, firmware, schema, configId, port, legacyId } = req.body || {};
     if (!id || typeof id !== 'string') {
       throw new ApiError('validation_error', 'register requires a string "id"', { field: 'id' });
     }
+    const mac = normalizeMac(req.body?.mac);
+    if (req.body?.mac !== undefined && req.body?.mac !== null && !mac) {
+      throw new ApiError('validation_error', 'register "mac" must be a 12-digit hex MAC', { field: 'mac' });
+    }
 
-    // Identity guard. A register that moves a KNOWN id to a different ip while
-    // the incumbent is still online means two physical units are claiming one
-    // id — almost always a unit flashed before its id was updated, so it boots
-    // holding an id another device already owns. Accepting it silently
-    // repoints the entry at the wrong hardware, which then receives the other
-    // room's scheduled commands, and leaves the real owner invisible until it
-    // next checks in. Refuse, and say exactly what collided.
-    //
-    // Scoped to an ONLINE incumbent so an ordinary ip change (new DHCP lease)
-    // is unaffected: a unit that actually moved stops answering at its old ip,
-    // ages out within OFFLINE_AFTER_MS, and its next register is accepted.
-    const heldByIp = identityConflict(id, ip);
-    if (heldByIp) {
-      log.warn('register_id_conflict', { id, claimingIp: ip, heldByIp });
+    // ---- migration: adopt the entry this unit already has, under its old id --
+    // A device that switches to a chip-derived id is the SAME device, but the
+    // change looks like "one device vanished, another appeared" — which would
+    // strand its desired config and its place in every schedule on an id
+    // nothing answers to. Two signals identify the predecessor; either one
+    // rekeys the existing entry onto the new id instead of starting fresh.
+    let migrated = null;
+    if (!getEntry(id)) {
+      // 1. Same chip, different id. Works whenever the old entry already
+      //    learned this MAC, and needs nothing from the firmware but the MAC.
+      // 2. `legacyId` — the id this firmware used to report. Bridges the FIRST
+      //    switchover, where the old entry predates MAC reporting entirely.
+      const predecessor = entryByMac(mac, id)
+        ?? (typeof legacyId === 'string' && legacyId !== id ? getEntry(legacyId) : null);
+      // Never rekey onto a predecessor known to be a different chip.
+      if (predecessor && !(predecessor.mac && mac && predecessor.mac !== mac)) {
+        const result = rekeyEntry(predecessor.id, id);
+        if (result.ok) {
+          migrated = { from: predecessor.id, scheduleIds: result.scheduleIds };
+          log.info('register_migrated', { oldId: predecessor.id, newId: id, mac, ...result });
+        }
+      }
+    }
+
+    // ---- identity guard -----------------------------------------------------
+    // Refuse a claim that would hand a known id to different hardware. With a
+    // MAC on both sides this is exact; without one it falls back to "the
+    // incumbent is online at another ip", which is what a unit flashed before
+    // its id was updated looks like. Skipped right after a migration, where we
+    // have already positively identified this unit as the entry's owner.
+    const conflict = migrated ? null : identityConflict(id, ip, mac);
+    if (conflict) {
+      log.warn('register_id_conflict', { id, claimingIp: ip, claimingMac: mac, ...conflict });
+      const held = conflict.reason === 'mac_mismatch'
+        ? `chip ${conflict.heldByMac}`
+        : `a unit at ${conflict.heldByIp} that is currently online`;
       throw new ApiError(
         'id_conflict',
-        `device id "${id}" is already held by a unit at ${heldByIp} that is currently online; `
-        + `the unit at ${ip} must be flashed with its own id`,
-        { id, claimingIp: ip, heldByIp },
+        `device id "${id}" is already held by ${held}; `
+        + `the unit at ${ip} must register under its own id`,
+        { id, claimingIp: ip, claimingMac: mac, ...conflict },
       );
     }
 
@@ -139,13 +167,14 @@ export function buildApp() {
       ip: ip ?? undefined,
       firmware: firmware ?? undefined,
       schema: schema ?? undefined,
+      mac: mac ?? undefined,
       // Optional: lets a unit that only self-registers (no mDNS) advertise a non-80 port.
       port: typeof port === 'number' ? port : undefined,
       unitConfigId: typeof configId === 'number' ? configId : undefined,
     });
     persist();
-    log.info('register', { id, ip, location, configId });
-    res.json({ ok: true });
+    log.info('register', { id, ip, location, configId, mac, migratedFrom: migrated?.from ?? null });
+    res.json({ ok: true, migratedFrom: migrated?.from ?? null });
   }));
 
   // ---- unit-pushed observed state (from its physical remote) ---------------
@@ -246,6 +275,35 @@ export function buildApp() {
     persist();
     log.info('device_outdoor_unit_set', { id: entry.id, outdoorUnit });
     res.json({ ok: true, device: toDevice(entry) });
+  });
+
+  // ---- UI: rekey a device to a new id --------------------------------------
+  // Manual counterpart to the automatic migration in POST /register, for when
+  // the automatic signals aren't available — e.g. a unit already reflashed to a
+  // chip-derived id before the bridge could learn its MAC, so nothing links the
+  // new entry to the old one. Moves the device's configuration AND its place in
+  // every schedule onto the new id, which is the part a delete-and-re-add
+  // cannot do.
+  app.post('/devices/:id/rekey', (req, res) => {
+    const entry = requireDevice(req);
+    const { newId } = req.body || {};
+    if (!newId || typeof newId !== 'string') {
+      throw new ApiError('validation_error', 'rekey requires a string "newId"', { field: 'newId' });
+    }
+    const target = getEntry(newId);
+    if (target && target.mac && entry.mac && target.mac !== entry.mac) {
+      throw new ApiError(
+        'id_conflict',
+        `"${newId}" already belongs to a different chip (${target.mac})`,
+        { id: newId, heldByMac: target.mac },
+      );
+    }
+    const result = rekeyEntry(entry.id, newId);
+    if (!result.ok) {
+      throw new ApiError('validation_error', `cannot rekey: ${result.reason}`, { reason: result.reason });
+    }
+    persist();
+    res.json({ ok: true, device: toDevice(getEntry(newId)), scheduleIds: result.scheduleIds });
   });
 
   // ---- UI: identify --------------------------------------------------------

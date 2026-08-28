@@ -1,6 +1,6 @@
 import { config } from './config.js';
 import {
-  allEntries, touch, upsert, persist, releaseIp, resolveDuplicateIps,
+  allEntries, touch, upsert, persist, releaseIp, resolveDuplicateIps, normalizeMac,
 } from './store.js';
 import { deviceClient } from './deviceClient.js';
 import { log } from './logger.js';
@@ -50,12 +50,24 @@ export async function pollOne(entry) {
       persist();
       return;
     }
+    // Same id, different chip. Only reachable if two units were flashed with
+    // one id, and unlike everything above it is not an inference — the ids
+    // match, so nothing else would catch it. Don't let the impostor's readings
+    // overwrite this entry.
+    const polledMac = normalizeMac(health.mac);
+    if (polledMac && entry.mac && polledMac !== entry.mac) {
+      log.warn('device_mac_changed', { id, expectedMac: entry.mac, foundMac: polledMac, ip: entry.ip });
+      releaseIp(id, 'ip_answers_from_other_chip');
+      persist();
+      return;
+    }
     // Any successful contact refreshes liveness.
     touch(id, {
       location: health.location ?? undefined,
       firmware: health.firmware ?? undefined,
       schema: health.schema ?? undefined,
       ip: health.ip ?? undefined,
+      mac: normalizeMac(health.mac) ?? undefined,
       rssi: health.rssi ?? null,
       uptimeSec: health.uptimeSec ?? null,
       unitConfigId: health.configId ?? null,

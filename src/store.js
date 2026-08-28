@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { config } from './config.js';
 import { log } from './logger.js';
-import { removeDeviceFromSchedules } from './scheduleStore.js';
+import { removeDeviceFromSchedules, renameDeviceInSchedules } from './scheduleStore.js';
 
 // In-memory device registry, keyed by device id, persisted to a JSON file.
 // Each entry:
@@ -15,6 +15,8 @@ import { removeDeviceFromSchedules } from './scheduleStore.js';
 //   rssi, uptimeSec, unitConfigId, applied,
 //   // learned from the unit's GET /config:
 //   reportedConfig,
+//   // factory-burned chip MAC (lowercase hex, no separators) — authoritative identity:
+//   mac,
 //   // the bridge's intent:
 //   desiredConfig, desiredConfigId,
 //   // manually assigned grouping (see POST /devices/:id/outdoor-unit):
@@ -40,6 +42,11 @@ function blankEntry(id) {
     unitConfigId: null,
     applied: null,
     reportedConfig: null,
+    // The unit's factory-burned chip MAC, normalized to lowercase hex with no
+    // separators, or null for firmware old enough not to report one. This is the
+    // only identifier the hardware cannot be flashed into lying about, so where
+    // it is known it — not the id, and not the ip — decides who a unit is.
+    mac: null,
     desiredConfig: null,
     desiredConfigId: null,
     // Most recent command initiated against this unit: { source, at } (or null).
@@ -206,6 +213,48 @@ export function pruneDuplicateIps() {
 }
 
 /**
+ * Move a device entry from `oldId` to `newId`, carrying everything the user
+ * configured on it — desiredConfig, outdoorUnit, lastCommand — and rewriting
+ * every schedule that referenced the old id. Returns { ok, reason }.
+ *
+ * This exists so a device can change its id WITHOUT being treated as a new
+ * device. The id was never a good identity: it is a string typed into the
+ * firmware before flashing, which is how one unit ended up claiming another's.
+ * Moving to a chip-derived id fixes that permanently, but the move itself would
+ * otherwise look exactly like "old device vanished, new device appeared" —
+ * stranding schedules on an id nothing answers to. Rekeying is the migration.
+ *
+ * If `newId` already exists it is treated as the same device arriving early
+ * (the unit registered under its new id before we learned the mapping): live
+ * facts from that entry win, the old entry's user configuration is kept.
+ */
+export function rekeyEntry(oldId, newId) {
+  if (oldId === newId) return { ok: false, reason: 'same_id' };
+  const from = registry.get(oldId);
+  if (!from) return { ok: false, reason: 'unknown_device' };
+
+  const existing = registry.get(newId);
+  // Start from the old entry (user configuration), then overlay whatever the
+  // new entry already learned about where the unit actually is right now.
+  const merged = { ...from, id: newId };
+  if (existing) {
+    for (const key of ['ip', 'port', 'lastSeen', 'down', 'rssi', 'uptimeSec',
+                       'mac', 'firmware', 'schema', 'location', 'orphaned',
+                       'unitConfigId', 'applied', 'reportedConfig']) {
+      if (existing[key] !== null && existing[key] !== undefined) merged[key] = existing[key];
+    }
+  }
+
+  registry.delete(oldId);
+  registry.set(newId, merged);
+  const affected = renameDeviceInSchedules(oldId, newId);
+  log.info('device_rekeyed', {
+    oldId, newId, mac: merged.mac, mergedWithExisting: !!existing, scheduleIds: affected,
+  });
+  return { ok: true, reason: existing ? 'merged' : 'moved', scheduleIds: affected };
+}
+
+/**
  * Merge fields into a device entry, creating it if needed. Only defined values
  * overwrite existing ones, so partial updates from different sources compose.
  * Does NOT persist — callers persist explicitly (persistence is triggered on
@@ -243,24 +292,55 @@ export function touch(id, fields = {}) {
 }
 
 /**
- * Would letting `id` claim `ip` hijack a live device? Returns the incumbent's
- * ip when it would, else null.
- *
- * True when the id is already held by an entry sitting at a DIFFERENT ip that
- * is still online — i.e. two physical units claiming one id, which is what a
- * unit flashed before its id was updated looks like. Shared by every inbound
- * identity claim (POST /register and mDNS), so a unit cannot simply take the
- * path that isn't guarded.
- *
- * Deliberately scoped to an ONLINE incumbent: a device that genuinely changed
- * ip (new DHCP lease) goes quiet at the old one and ages out within
- * OFFLINE_AFTER_MS, after which its claim is accepted normally.
+ * Normalize a reported MAC to lowercase hex with no separators, or null if it
+ * isn't one. Accepts the usual spellings ("84:FC:E6:12:34:56", "84-fc-e6-...",
+ * bare hex) so firmware formatting differences can't split one chip into two
+ * identities.
  */
-export function identityConflict(id, ip) {
-  if (!ip) return null;
+export function normalizeMac(mac) {
+  if (typeof mac !== 'string') return null;
+  const hex = mac.trim().toLowerCase().replace(/[^0-9a-f]/g, '');
+  return /^[0-9a-f]{12}$/.test(hex) ? hex : null;
+}
+
+/** The entry already registered to this chip MAC, if any (excluding `exceptId`). */
+export function entryByMac(mac, exceptId = null) {
+  const wanted = normalizeMac(mac);
+  if (!wanted) return null;
+  for (const entry of registry.values()) {
+    if (entry.mac === wanted && entry.id !== exceptId) return entry;
+  }
+  return null;
+}
+
+/**
+ * Would letting `id` claim this ip/mac hijack a live device? Returns
+ * { reason, heldByIp, heldByMac } when it would, else null.
+ *
+ * Shared by every inbound identity claim (POST /register and mDNS), so a unit
+ * cannot simply take the path that isn't guarded.
+ */
+export function identityConflict(id, ip, mac) {
   const incumbent = registry.get(id);
-  if (!incumbent || !incumbent.ip || incumbent.ip === ip) return null;
-  return computeStatus(incumbent) === 'online' ? incumbent.ip : null;
+  if (!incumbent) return null;
+
+  const claimed = normalizeMac(mac);
+
+  // Authoritative path. Once both sides report a chip MAC there is nothing to
+  // infer: the id belongs to whichever chip owns it, full stop.
+  if (claimed && incumbent.mac) {
+    if (incumbent.mac === claimed) return null; // same chip — an ip change is just an ip change
+    return { reason: 'mac_mismatch', heldByIp: incumbent.ip, heldByMac: incumbent.mac };
+  }
+
+  // Fallback for firmware that doesn't report a MAC yet: the ip heuristic. A
+  // claim that moves a known id onto a different ip while the incumbent is
+  // still online is two units claiming one id. Weaker than the MAC check — it
+  // can't tell a fast DHCP move from a collision — which is exactly why it is
+  // scoped to an online incumbent, and why reporting a MAC is worth doing.
+  if (!ip || !incumbent.ip || incumbent.ip === ip) return null;
+  if (computeStatus(incumbent) !== 'online') return null;
+  return { reason: 'ip_held_by_online_device', heldByIp: incumbent.ip, heldByMac: null };
 }
 
 export function computeStatus(entry, now = Date.now()) {
@@ -303,6 +383,7 @@ export function toDevice(entry, now = Date.now()) {
     applied,
     desiredConfig: entry.desiredConfig,
     reportedConfig: entry.reportedConfig,
+    mac: entry.mac,
     lastCommand: entry.lastCommand,
     orphaned: entry.orphaned,
     outdoorUnit: entry.outdoorUnit,

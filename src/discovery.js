@@ -4,7 +4,8 @@ import { log } from './logger.js';
 
 // mDNS discovery for service type _acctrl._tcp. Each advertised service carries
 // TXT records id/loc/fw/mac plus host/ip/port. We merge these into the registry
-// keyed by device id and handle up/down events.
+// keyed by device id, following a unit for the whole life of the process:
+// first sighting, later changes to what it advertises, and down.
 
 let bonjour = null;
 let browser = null;
@@ -15,11 +16,13 @@ function pickIp(service) {
   return v4 || service.referer?.address || null;
 }
 
-function onUp(service) {
+// Merge one advertisement into the registry. Every browser event carrying a
+// current view of a service routes through here, not just first sighting.
+function onAdvertisement(service, event) {
   const txt = service.txt || {};
   const id = txt.id;
   if (!id) {
-    log.warn('mdns_service_missing_id', { name: service.name, host: service.host });
+    log.warn('mdns_service_missing_id', { name: service.name, host: service.host, event });
     return;
   }
   const ip = pickIp(service);
@@ -42,7 +45,8 @@ function onUp(service) {
     mac: mac ?? undefined,
     port: service.port ?? undefined,
   });
-  log.info('mdns_up', { id, ip, port: service.port, location: txt.loc });
+  log.info(event === 'up' ? 'mdns_up' : 'mdns_service_updated',
+           { id, ip, port: service.port, location: txt.loc, firmware: txt.fw, event });
   persist();
 }
 
@@ -57,17 +61,39 @@ function onDown(service) {
   persist();
 }
 
-export function startDiscovery() {
-  bonjour = new Bonjour();
-  browser = bonjour.find({ type: 'acctrl' });
-  browser.on('up', onUp);
+/**
+ * Start browsing for units. Tests inject a stand-in browser (any emitter
+ * speaking the same events) so the wiring itself is covered — which events we
+ * subscribe to is precisely where a reflashed unit's new identity went missing.
+ */
+export function startDiscovery({ browser: injected = null } = {}) {
+  if (injected) {
+    browser = injected;
+  } else {
+    bonjour = new Bonjour();
+    browser = bonjour.find({ type: 'acctrl' });
+  }
+  browser.on('up', (service) => onAdvertisement(service, 'up'));
+  // bonjour-service caches discovered services by instance fqdn and emits 'up'
+  // only the FIRST time it sees one; a re-announcement under a known fqdn comes
+  // back as txt-update (TXT changed) or srv-update (host/port changed) instead.
+  // Our instance names are stable across a reflash by design — a unit keeps
+  // advertising ac-<location>.local while its id/mac/fw TXT records change — so
+  // listening for 'up' alone pinned the registry to whatever a unit advertised
+  // the first time THIS PROCESS saw it. Nothing shook it loose either: the
+  // browser's cache has no expiry timer and it re-queries only at startup, so a
+  // reflashed unit's new id and firmware stayed invisible until the bridge was
+  // restarted — which is exactly how a unit moved onto its chip-derived id went
+  // unnoticed for a day.
+  browser.on('txt-update', (service) => onAdvertisement(service, 'txt-update'));
+  browser.on('srv-update', (service) => onAdvertisement(service, 'srv-update'));
   browser.on('down', onDown);
   log.info('mdns_browsing', { type: '_acctrl._tcp' });
 }
 
 export function stopDiscovery() {
   try {
-    browser?.stop();
+    browser?.stop?.();
     bonjour?.destroy();
   } catch (err) {
     log.warn('mdns_stop_failed', { error: err.message });

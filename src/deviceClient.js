@@ -73,6 +73,29 @@ async function call(entry, method, pathname, { body, auth = true, timeoutMs = co
   return data ?? {};
 }
 
+// IR transmissions occasionally miss, so send the command twice with a short
+// delay between. Succeeds if either attempt does (the later result wins); only
+// throws, with the second error, if both fail.
+async function callTwice(...args) {
+  const delay = config.deviceCommandRepeatDelayMs;
+  if (!(delay > 0)) return call(...args);
+
+  let first;
+  let firstErr;
+  try {
+    first = await call(...args);
+  } catch (err) {
+    firstErr = err;
+  }
+  await new Promise((resolve) => setTimeout(resolve, delay));
+  try {
+    return await call(...args);
+  } catch (err) {
+    if (firstErr) throw err;
+    return first;
+  }
+}
+
 export const deviceClient = {
   // GET /health (no auth) → { ok, id, location, firmware, schema, ip, rssi, uptimeSec, configId, applied }
   health: (entry) => call(entry, 'GET', '/health', { auth: false }),
@@ -80,11 +103,11 @@ export const deviceClient = {
   getConfig: (entry) => call(entry, 'GET', '/config'),
   // POST /config (auth) → { ok, configId, verified, attempts } — transmits IR.
   postConfig: (entry, cfg) =>
-    call(entry, 'POST', '/config', { body: cfg, timeoutMs: config.deviceCommandTimeoutMs }),
+    callTwice(entry, 'POST', '/config', { body: cfg, timeoutMs: config.deviceCommandTimeoutMs }),
   // POST /identify (auth) → { ok } — blinks the unit's LED for ~3s before answering.
   identify: (entry) =>
     call(entry, 'POST', '/identify', { body: {}, timeoutMs: config.deviceCommandTimeoutMs }),
   // POST /resend (auth) → { ok, configId, verified, attempts } — transmits IR.
   resend: (entry) =>
-    call(entry, 'POST', '/resend', { body: {}, timeoutMs: config.deviceCommandTimeoutMs }),
+    callTwice(entry, 'POST', '/resend', { body: {}, timeoutMs: config.deviceCommandTimeoutMs }),
 };

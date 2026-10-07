@@ -73,6 +73,9 @@ export const config = {
   // but the bridge records the push as failed and leaves desiredConfigId stale,
   // so the UI shows drift on a command that actually worked.
   deviceCommandTimeoutMs: int('DEVICE_COMMAND_TIMEOUT_MS', 8_000),
+  // Commands that transmit IR are sent twice, this far apart, because a single
+  // send occasionally "misses". 0 disables the repeat.
+  deviceCommandRepeatDelayMs: int('DEVICE_COMMAND_REPEAT_DELAY_MS', 1_000),
   version: '1.0.0',
   service: 'ac-bridge',
 };

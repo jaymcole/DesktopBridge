@@ -58,6 +58,7 @@ on startup beyond the normal loop.
 | `DATA_DIR`         | `./data`                 | Directory for the persisted registry, schedules and command log.    |
 | `DEVICE_TIMEOUT_MS`| `5000`                   | Timeout for read-only polls of a unit (`GET /health`, `GET /config`). |
 | `DEVICE_COMMAND_TIMEOUT_MS`| `8000`           | Timeout for calls that make a unit act (`POST /config`, `/resend`, `/identify`). These transmit IR and verify it, or blink the LED, so they are far slower than a poll. |
+| `DEVICE_COMMAND_REPEAT_DELAY_MS` | `1000`      | `POST /config` and `/resend` are sent to the unit twice, this many ms apart, since a single IR send occasionally misses. `0` sends once. |
 
 ## Discovery
 
